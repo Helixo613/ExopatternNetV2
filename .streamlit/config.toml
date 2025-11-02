@@ -1,0 +1,22 @@
+[server]
+# Enable CORS for WSL access from Windows browser
+enableCORS = false
+enableXsrfProtection = false
+
+# Bind to all network interfaces (0.0.0.0) to allow access from Windows
+headless = true
+address = "0.0.0.0"
+port = 8501
+
+# File watcher settings for WSL
+fileWatcherType = "poll"
+
+[browser]
+# Don't auto-open browser in WSL (Windows browser should connect manually)
+gatherUsageStats = false
+serverAddress = "localhost"
+serverPort = 8501
+
+[theme]
+base = "dark"
+primaryColor = "#1f77b4"
