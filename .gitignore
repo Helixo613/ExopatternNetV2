@@ -64,3 +64,4 @@ Thumbs.db
 *.tmp
 *.txt
 !README.txt
+!requirements.txt
