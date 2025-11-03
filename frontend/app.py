@@ -7,9 +7,11 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.figure_factory as ff
 import sys
 from pathlib import Path
 import io
+from sklearn.metrics import confusion_matrix, classification_report
 
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -242,6 +244,141 @@ def create_analysis_dashboard(df, results):
     return fig
 
 
+def create_confusion_matrix_plot(y_true, y_pred, labels, title="Confusion Matrix"):
+    """Create an interactive confusion matrix heatmap."""
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Calculate percentages
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+
+    # Create annotations with counts and percentages
+    annotations = []
+    for i in range(len(cm)):
+        for j in range(len(cm[0])):
+            annotations.append(
+                f"{cm[i][j]}<br>({cm_normalized[i][j]:.1f}%)"
+            )
+
+    # Reshape annotations to match matrix
+    annotations = np.array(annotations).reshape(cm.shape)
+
+    fig = ff.create_annotated_heatmap(
+        z=cm,
+        x=labels,
+        y=labels,
+        annotation_text=annotations,
+        colorscale='Blues',
+        showscale=True
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Predicted",
+        yaxis_title="Actual",
+        height=400,
+        template='plotly_white'
+    )
+
+    return fig
+
+
+def create_proxy_truth_matrix(df, anomaly_mask, threshold=3.0):
+    """Create confusion matrix comparing ML predictions vs statistical outliers (proxy truth)."""
+    # Use z-score as proxy ground truth
+    flux = df['flux'].values
+    z_scores = np.abs((flux - np.mean(flux)) / np.std(flux))
+    statistical_anomalies = z_scores > threshold
+
+    # Convert to binary (1=anomaly, 0=normal)
+    y_true = statistical_anomalies.astype(int)
+    y_pred = anomaly_mask.astype(int)
+
+    labels = ['Normal', 'Anomaly']
+    fig = create_confusion_matrix_plot(y_true, y_pred, labels,
+                                       title="ML Predictions vs Statistical Outliers (Z-Score > 3σ)")
+
+    # Calculate agreement metrics
+    agreement = np.mean(y_true == y_pred) * 100
+
+    return fig, agreement, statistical_anomalies
+
+
+def create_multi_method_comparison(df, detector, preprocessor, window_size):
+    """Compare predictions from different detection methods."""
+    df_processed = df.copy()
+
+    # Extract features
+    features = preprocessor.extract_features(df_processed, window_size)
+
+    # Get predictions from each method separately
+    # Isolation Forest
+    if_pred = detector.isolation_forest.predict(detector.scaler.transform(features))
+
+    # LOF
+    lof_pred = detector.lof.predict(detector.scaler.transform(features))
+
+    # Map to points
+    stride = max(1, window_size // 4)
+
+    # Isolation Forest anomaly mask
+    if_mask = np.zeros(len(df_processed), dtype=bool)
+    for i, pred in enumerate(if_pred):
+        if pred == -1:
+            start_idx = i * stride
+            end_idx = min(start_idx + window_size, len(df_processed))
+            if_mask[start_idx:end_idx] = True
+
+    # LOF anomaly mask
+    lof_mask = np.zeros(len(df_processed), dtype=bool)
+    for i, pred in enumerate(lof_pred):
+        if pred == -1:
+            start_idx = i * stride
+            end_idx = min(start_idx + window_size, len(df_processed))
+            lof_mask[start_idx:end_idx] = True
+
+    # Statistical method
+    point_anomalies = detector.detect_point_anomalies(df_processed, threshold=3.0)
+    stat_mask = np.zeros(len(df_processed), dtype=bool)
+    if len(point_anomalies['indices']) > 0:
+        stat_mask[point_anomalies['indices']] = True
+
+    # Create comparison matrices
+    figs = []
+
+    # IF vs LOF
+    if_binary = if_mask.astype(int)
+    lof_binary = lof_mask.astype(int)
+    labels = ['Normal', 'Anomaly']
+
+    fig1 = create_confusion_matrix_plot(if_binary, lof_binary, labels,
+                                        title="Isolation Forest vs Local Outlier Factor")
+    figs.append(fig1)
+
+    # IF vs Statistical
+    stat_binary = stat_mask.astype(int)
+    fig2 = create_confusion_matrix_plot(if_binary, stat_binary, labels,
+                                        title="Isolation Forest vs Statistical (Z-Score)")
+    figs.append(fig2)
+
+    # LOF vs Statistical
+    fig3 = create_confusion_matrix_plot(lof_binary, stat_binary, labels,
+                                        title="LOF vs Statistical (Z-Score)")
+    figs.append(fig3)
+
+    # Calculate agreement percentages
+    if_lof_agreement = np.mean(if_mask == lof_mask) * 100
+    if_stat_agreement = np.mean(if_mask == stat_mask) * 100
+    lof_stat_agreement = np.mean(lof_mask == stat_mask) * 100
+
+    agreements = {
+        'IF vs LOF': if_lof_agreement,
+        'IF vs Statistical': if_stat_agreement,
+        'LOF vs Statistical': lof_stat_agreement
+    }
+
+    return figs, agreements
+
+
 def analyze_lightcurve(uploaded_file, detector, preprocessor, contamination, window_size):
     """Analyze uploaded light curve."""
     try:
@@ -413,6 +550,104 @@ def main():
                 st.subheader(" Detailed Analysis Dashboard")
                 dashboard_fig = create_analysis_dashboard(df, results)
                 st.plotly_chart(dashboard_fig, use_container_width=True)
+
+                # Confusion Matrices Section
+                st.subheader("📊 Detection Method Evaluation & Comparison")
+                st.write("Confusion matrices showing agreement between different detection approaches")
+
+                with st.expander("ℹ️ Understanding These Matrices", expanded=False):
+                    st.markdown("""
+                    **What are these confusion matrices?**
+
+                    Since uploaded data doesn't have labeled ground truth, we compare different detection methods:
+
+                    1. **ML vs Statistical (Proxy Truth):** Compares ML ensemble predictions with statistical outliers (Z-score > 3σ)
+                       - High agreement suggests the ML model aligns with traditional statistical methods
+
+                    2. **Method Comparison:** Shows how different ML algorithms (Isolation Forest, LOF) and statistical methods agree
+                       - Helps understand which methods are more conservative or aggressive
+                       - Disagreements can reveal different types of anomalies each method catches
+
+                    **Interpreting the matrices:**
+                    - **Diagonal values (top-left & bottom-right):** Agreement between methods
+                    - **Off-diagonal values:** Disagreements
+                    - **High agreement (>90%):** Methods detect similar patterns
+                    - **Low agreement (<70%):** Methods find different anomalies - might need investigation
+                    """)
+
+                # Create tabs for different confusion matrix types
+                cm_tab1, cm_tab2 = st.tabs(["🎯 ML vs Statistical", "🔬 Multi-Method Comparison"])
+
+                with cm_tab1:
+                    st.write("**Comparing ML Ensemble predictions with Statistical outliers (Z-score method)**")
+
+                    try:
+                        proxy_fig, agreement, stat_anomalies = create_proxy_truth_matrix(
+                            df, results['anomaly_mask'], threshold=3.0
+                        )
+
+                        # Show metrics
+                        metric_cols = st.columns(3)
+                        with metric_cols[0]:
+                            st.metric("Overall Agreement", f"{agreement:.1f}%")
+                        with metric_cols[1]:
+                            st.metric("ML Detected", int(np.sum(results['anomaly_mask'])))
+                        with metric_cols[2]:
+                            st.metric("Statistical Detected", int(np.sum(stat_anomalies)))
+
+                        st.plotly_chart(proxy_fig, use_container_width=True)
+
+                        # Interpretation
+                        if agreement > 90:
+                            st.success("✅ Excellent agreement! ML predictions align well with statistical methods.")
+                        elif agreement > 75:
+                            st.info("✓ Good agreement. Some differences expected due to different detection approaches.")
+                        else:
+                            st.warning("⚠️ Lower agreement. ML may be detecting patterns beyond simple outliers.")
+
+                    except Exception as e:
+                        st.error(f"Could not create proxy truth matrix: {str(e)}")
+
+                with cm_tab2:
+                    st.write("**Comparing predictions from Isolation Forest, LOF, and Statistical methods**")
+
+                    try:
+                        comparison_figs, agreements = create_multi_method_comparison(
+                            df,
+                            st.session_state.detector,
+                            st.session_state.preprocessor,
+                            window_size
+                        )
+
+                        # Show agreement metrics
+                        st.write("**Method Agreement Percentages:**")
+                        agree_cols = st.columns(3)
+                        for i, (method_pair, agree_pct) in enumerate(agreements.items()):
+                            with agree_cols[i]:
+                                st.metric(method_pair, f"{agree_pct:.1f}%")
+
+                        # Display matrices in columns
+                        for i in range(0, len(comparison_figs), 2):
+                            cols = st.columns(2)
+                            with cols[0]:
+                                st.plotly_chart(comparison_figs[i], use_container_width=True)
+                            if i + 1 < len(comparison_figs):
+                                with cols[1]:
+                                    st.plotly_chart(comparison_figs[i+1], use_container_width=True)
+
+                        # Interpretation
+                        avg_agreement = np.mean(list(agreements.values()))
+                        if avg_agreement > 85:
+                            st.success("✅ High consensus across methods! Detected anomalies are robust.")
+                        elif avg_agreement > 70:
+                            st.info("✓ Moderate consensus. Different methods capture different aspects of anomalies.")
+                        else:
+                            st.warning("⚠️ Lower consensus. Methods detect different patterns - review individual results.")
+
+                    except Exception as e:
+                        st.error(f"Could not create multi-method comparison: {str(e)}")
+
+                st.markdown("---")
 
                 # Anomaly details
                 col1, col2 = st.columns(2)

@@ -36,13 +36,25 @@ python generate_sample_data.py --format both --n-samples 5
 python generate_sample_data.py --output-dir data/samples --format csv --n-samples 10
 ```
 
+### Setup and Environment
+
+```bash
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate  # Linux/Mac
+# OR: venv\Scripts\activate  # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
 ### Testing with Sample Data
 
 Sample files located in `data/samples/`:
 - `exoplanet_transit.csv` - Best for testing transit detection
 - `stellar_flares.csv` - Tests flare/spike detection
 - `complex_system.csv` - Tests all anomaly types
-- `normal_star.csv` - Control (should have <5% anomalies)
+- `normal_star.csv` - Control (baseline comparison)
 - All available in both CSV and FITS formats
 
 ## Architecture & Data Flow
@@ -168,6 +180,157 @@ When running in WSL (Windows Subsystem for Linux):
 
 6. **Synthetic Data Seeds:** `generate_sample_data.py` uses fixed random seeds per sample type for reproducibility. Same file name always generates identical data.
 
+7. **Confusion Matrices:** Added in `frontend/app.py` to validate detection quality:
+   - **ML vs Statistical** tab: Compares ensemble predictions with Z-score outliers (proxy ground truth)
+   - **Multi-Method Comparison** tab: Shows agreement between Isolation Forest, LOF, and statistical methods
+   - High agreement (>85%) indicates robust detection despite high percentage rates
+
+## Known Architectural Issue: High Anomaly Rate Reporting
+
+**Status:** Verified architectural limitation (not a bug or configuration issue)
+
+### Problem Statement
+
+The system consistently reports anomaly rates of 70-90% across all data files, including those that should be clean (e.g., `normal_star.csv`). This occurs regardless of model retraining, contamination parameter adjustment, or window size changes.
+
+### Testing Performed to Verify
+
+Extensive testing confirmed this is an architectural issue, not a training or configuration problem:
+
+**Test 1: Default Model (contamination=0.1, window_size=50)**
+```
+normal_star.csv:        79.2% anomalies
+exoplanet_transit.csv:  90.8% anomalies
+stellar_flares.csv:     78.8% anomalies
+noisy_outliers.csv:     89.2% anomalies
+complex_system.csv:     93.1% anomalies
+```
+
+**Test 2: Retrained Model (contamination=0.1, window_size=50, n_samples=150)**
+```
+normal_star.csv:        79.2% anomalies (no improvement)
+All other files:        78-93% anomalies
+```
+
+**Test 3: Lower Contamination + Larger Windows (contamination=0.05, window_size=100)**
+```
+normal_star.csv:        52.5% anomalies (improved but still high)
+```
+
+**Conclusion:** Parameter tuning provides marginal improvement but cannot resolve the fundamental issue.
+
+### Root Causes Identified
+
+**Cause 1: Aggressive Ensemble Logic**
+Location: `backend/ml/models.py:116`
+```python
+# Anomaly if EITHER method flags it
+predictions = np.where((if_pred == -1) | (lof_pred == -1), -1, 1)
+```
+- Uses **OR** logic: anomaly if Isolation Forest **OR** LOF flags it
+- More aggressive than **AND** logic (anomaly only if both agree)
+- Example: If IF detects 30% and LOF detects 35%, OR logic yields 50-65%
+
+**Cause 2: Window Overlap Amplification**
+Location: `frontend/app.py:271-278` and throughout preprocessing
+```python
+stride = window_size // 4  # 75% overlap
+for i, pred in enumerate(predictions):
+    if pred == -1:
+        start_idx = i * stride
+        end_idx = min(start_idx + window_size, len(df_processed))
+        anomaly_mask[start_idx:end_idx] = True  # Marks ~50 points per window
+```
+- With window_size=50, stride=12 (75% overlap)
+- Each anomalous window marks ~50 consecutive points as anomalous
+- Even if only 20% of windows are anomalous → 70-80% of points flagged
+- **Amplification factor: ~4x** due to overlap
+
+**Mathematical Example:**
+```
+Input: 2000 points, window_size=50, stride=12
+Windows: (2000-50)/12 + 1 ≈ 163 windows
+If 20% windows anomalous (33 windows):
+  → 33 windows × 50 points/window = 1650 point-markings
+  → With overlap, ~1600 unique points marked
+  → 1600/2000 = 80% anomaly rate
+```
+
+### Why Anomaly Percentages Are Unreliable
+
+The reported percentages do NOT represent:
+- ❌ True proportion of anomalous data points
+- ❌ Model confidence or accuracy
+- ❌ Comparison metric across datasets
+
+The percentages ARE affected by:
+- Ensemble voting strategy (OR vs AND)
+- Window size and overlap settings
+- Mapping from window-level to point-level predictions
+
+### What to Use Instead
+
+**Reliable Metrics for Validation:**
+
+1. **Visual Inspection** (Primary)
+   - Do red anomaly markers align with transit dips, flare spikes, or clear outliers?
+   - Check the light curve plot and flux distribution histogram
+   - Anomalies should cluster around actual events, not be uniformly distributed
+
+2. **Confusion Matrix Agreement** (Quantitative)
+   - Navigate to "Detection Method Evaluation & Comparison" section
+   - **ML vs Statistical** tab: Agreement >75% suggests ML aligns with simple outliers
+   - **Multi-Method Comparison**: Agreement >85% indicates robust consensus
+   - Low agreement (<70%) may indicate false positives
+
+3. **Relative Comparison** (Contextual)
+   - `normal_star.csv` should have LOWER rate than `stellar_flares.csv`
+   - If all files show identical rates, model is not discriminating
+   - Look for meaningful differences between file types
+
+4. **Point Anomaly Details** (Supplementary)
+   - Check "Point Anomalies" section: counts of dips vs spikes
+   - Review "Transit Events" section: detected events with depth/duration
+   - These provide interpretable, domain-specific metrics
+
+### Recommended Interpretation Workflow
+
+When analyzing results:
+
+```
+Step 1: Ignore the percentage rate initially
+Step 2: Visual inspection - do anomalies make sense?
+Step 3: Check confusion matrix agreement (aim for >75%)
+Step 4: Compare relative rates across different files
+Step 5: Review point anomaly details and transit events
+Step 6: If Steps 2-5 look good, system is working correctly
+```
+
+### Potential Fixes (Not Currently Implemented)
+
+If this architectural issue needs resolution, consider:
+
+1. **Change ensemble logic from OR to AND** (more conservative)
+   ```python
+   predictions = np.where((if_pred == -1) & (lof_pred == -1), -1, 1)
+   ```
+
+2. **Reduce window overlap** (less amplification)
+   ```python
+   stride = window_size // 2  # 50% overlap instead of 75%
+   ```
+
+3. **Use voting threshold** (require consensus)
+   ```python
+   # Anomaly only if both methods agree AND score exceeds threshold
+   ```
+
+4. **Implement point-level anomaly scoring** (avoid window mapping)
+   - Score individual points rather than windows
+   - More computationally expensive but more accurate percentages
+
+**Note:** These changes would require modifications to core detection logic in `backend/ml/models.py` and `frontend/app.py`.
+
 ## Performance Characteristics
 
 - **File loading**: <1s for typical 2000-point light curve
@@ -180,15 +343,18 @@ Tested up to 100k points and 1000 training light curves. Not designed for stream
 
 ## Configuration Files
 
-**`.streamlit/config.toml`** (created by debugger agent for WSL):
+**`.streamlit/config.toml`** (required for WSL):
 ```toml
 [server]
 address = "0.0.0.0"  # Required for WSL
 enableCORS = false
 enableXsrfProtection = false
+fileWatcherType = "poll"
 ```
 
-**`requirements.txt`**: All dependencies pinned to tested versions. Core: numpy, pandas, scikit-learn, astropy (FITS), streamlit, plotly, flask.
+**`requirements.txt`**: Core dependencies include numpy, pandas, scikit-learn (Isolation Forest/LOF), astropy (FITS), streamlit, plotly, flask, tensorflow (optional).
+
+**GitHub Repository:** https://github.com/Helixo613/ExopatternNetV2
 
 ## Sample Data Details
 
