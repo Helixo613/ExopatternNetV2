@@ -282,6 +282,53 @@ def create_confusion_matrix_plot(y_true, y_pred, labels, title="Confusion Matrix
     return fig
 
 
+def map_window_predictions_to_points_voting(predictions, window_size, n_points, stride, vote_threshold=0.3):
+    """
+    Map window-level predictions to point-level using voting.
+
+    A point is anomalous only if >= vote_threshold of windows covering it are anomalous.
+    This prevents the amplification effect from window overlap.
+
+    Args:
+        predictions: Window-level predictions (-1 for anomaly, 1 for normal)
+        window_size: Size of sliding windows
+        n_points: Total number of data points
+        stride: Stride between windows
+        vote_threshold: Minimum proportion of anomalous windows to flag point (0.3 = 30%)
+
+    Returns:
+        anomaly_mask: Boolean array of length n_points
+    """
+    # Track how many windows cover each point and how many flag it as anomalous
+    window_count = np.zeros(n_points, dtype=int)
+    anomaly_count = np.zeros(n_points, dtype=int)
+
+    for i, pred in enumerate(predictions):
+        start_idx = i * stride
+        end_idx = min(start_idx + window_size, n_points)
+
+        # Every point in this window is covered by this window
+        window_count[start_idx:end_idx] += 1
+
+        # If this window predicts anomaly, increment anomaly count
+        if pred == -1:
+            anomaly_count[start_idx:end_idx] += 1
+
+    # Calculate anomaly vote percentage for each point
+    # Avoid division by zero
+    vote_percentage = np.divide(
+        anomaly_count,
+        window_count,
+        out=np.zeros_like(anomaly_count, dtype=float),
+        where=window_count > 0
+    )
+
+    # Point is anomalous if vote percentage exceeds threshold
+    anomaly_mask = vote_percentage >= vote_threshold
+
+    return anomaly_mask
+
+
 def create_proxy_truth_matrix(df, anomaly_mask, threshold=3.0):
     """Create confusion matrix comparing ML predictions vs statistical outliers (proxy truth)."""
     # Use z-score as proxy ground truth
@@ -303,7 +350,7 @@ def create_proxy_truth_matrix(df, anomaly_mask, threshold=3.0):
     return fig, agreement, statistical_anomalies
 
 
-def create_multi_method_comparison(df, detector, preprocessor, window_size):
+def create_multi_method_comparison(df, detector, preprocessor, window_size, vote_threshold=0.3):
     """Compare predictions from different detection methods."""
     df_processed = df.copy()
 
@@ -317,30 +364,24 @@ def create_multi_method_comparison(df, detector, preprocessor, window_size):
     # LOF
     lof_pred = detector.lof.predict(detector.scaler.transform(features))
 
-    # Map to points
-    stride = max(1, window_size // 4)
+    # Map to points using voting (use same stride as feature extraction - 50% overlap)
+    stride = max(1, window_size // 2)
 
     # Isolation Forest anomaly mask
-    if_mask = np.zeros(len(df_processed), dtype=bool)
-    for i, pred in enumerate(if_pred):
-        if pred == -1:
-            start_idx = i * stride
-            end_idx = min(start_idx + window_size, len(df_processed))
-            if_mask[start_idx:end_idx] = True
+    if_mask = map_window_predictions_to_points_voting(
+        if_pred, window_size, len(df_processed), stride, vote_threshold
+    )
 
     # LOF anomaly mask
-    lof_mask = np.zeros(len(df_processed), dtype=bool)
-    for i, pred in enumerate(lof_pred):
-        if pred == -1:
-            start_idx = i * stride
-            end_idx = min(start_idx + window_size, len(df_processed))
-            lof_mask[start_idx:end_idx] = True
+    lof_mask = map_window_predictions_to_points_voting(
+        lof_pred, window_size, len(df_processed), stride, vote_threshold
+    )
 
     # Statistical method
     point_anomalies = detector.detect_point_anomalies(df_processed, threshold=3.0)
     stat_mask = np.zeros(len(df_processed), dtype=bool)
-    if len(point_anomalies['indices']) > 0:
-        stat_mask[point_anomalies['indices']] = True
+    if len(point_anomalies['anomaly_indices']) > 0:
+        stat_mask[point_anomalies['anomaly_indices']] = True
 
     # Create comparison matrices
     figs = []
@@ -379,7 +420,8 @@ def create_multi_method_comparison(df, detector, preprocessor, window_size):
     return figs, agreements
 
 
-def analyze_lightcurve(uploaded_file, detector, preprocessor, contamination, window_size):
+def analyze_lightcurve(uploaded_file, detector, preprocessor, contamination, window_size,
+                       vote_threshold=0.3, ensemble_strategy='score_threshold'):
     """Analyze uploaded light curve."""
     try:
         # Load data
@@ -401,18 +443,15 @@ def analyze_lightcurve(uploaded_file, detector, preprocessor, contamination, win
         # Extract features
         features = preprocessor.extract_features(df_processed, window_size)
 
-        # Predict anomalies
-        predictions, scores = detector.predict_with_scores(features)
+        # Predict anomalies using specified ensemble strategy
+        predictions, scores = detector.predict_with_scores(features, ensemble_strategy=ensemble_strategy)
 
-        # Map window predictions to points
-        stride = max(1, window_size // 4)
-        anomaly_mask = np.zeros(len(df_processed), dtype=bool)
-
-        for i, pred in enumerate(predictions):
-            if pred == -1:
-                start_idx = i * stride
-                end_idx = min(start_idx + window_size, len(df_processed))
-                anomaly_mask[start_idx:end_idx] = True
+        # Map window predictions to points using voting (reduces false positives)
+        # Use same stride as feature extraction (50% overlap)
+        stride = max(1, window_size // 2)
+        anomaly_mask = map_window_predictions_to_points_voting(
+            predictions, window_size, len(df_processed), stride, vote_threshold
+        )
 
         # Point anomalies
         point_anomalies = detector.detect_point_anomalies(df_processed, threshold=3.0)
@@ -468,14 +507,44 @@ def main():
 
     # Detection parameters
     st.sidebar.subheader("Detection Parameters")
-    contamination = st.sidebar.slider(
-        "Expected Anomaly Rate",
-        min_value=0.01,
-        max_value=0.5,
-        value=0.1,
-        step=0.01,
-        help="Expected proportion of anomalies in the data"
+
+    # Contamination presets
+    CONTAMINATION_PRESETS = {
+        'Very Clean (1%)': 0.01,
+        'Clean (3%)': 0.03,
+        'Moderate (5%)': 0.05,
+        'Noisy (10%)': 0.1,
+        'Very Noisy (15%)': 0.15,
+        'Custom': None
+    }
+
+    contamination_preset = st.sidebar.selectbox(
+        "Data Quality Preset",
+        options=list(CONTAMINATION_PRESETS.keys()),
+        index=2,  # Default to 'Moderate (5%)'
+        help=(
+            "Choose based on expected data quality:\n"
+            "- Very Clean: Known clean data, strict detection\n"
+            "- Clean: Normal stellar variability\n"
+            "- Moderate: Some expected anomalies (RECOMMENDED)\n"
+            "- Noisy: High noise or active star\n"
+            "- Very Noisy: Extremely variable data\n"
+            "- Custom: Set your own value"
+        )
     )
+
+    if contamination_preset == 'Custom':
+        contamination = st.sidebar.slider(
+            "Expected Anomaly Rate",
+            min_value=0.01,
+            max_value=0.5,
+            value=0.05,
+            step=0.01,
+            help="Expected proportion of anomalies in the data"
+        )
+    else:
+        contamination = CONTAMINATION_PRESETS[contamination_preset]
+        st.sidebar.info(f"Using {contamination*100:.0f}% contamination rate")
 
     window_size = st.sidebar.slider(
         "Analysis Window Size",
@@ -485,6 +554,32 @@ def main():
         step=10,
         help="Number of points in each analysis window"
     )
+
+    vote_threshold = st.sidebar.slider(
+        "Voting Threshold",
+        min_value=0.1,
+        max_value=0.9,
+        value=0.3,
+        step=0.05,
+        help="Minimum proportion of windows that must agree to flag a point as anomalous (0.3 = 30%)"
+    )
+
+    ensemble_strategy = st.sidebar.selectbox(
+        "Ensemble Strategy",
+        options=['score_threshold', 'weighted_vote', 'and', 'or'],
+        index=0,  # Default to 'score_threshold'
+        help=(
+            "How to combine Isolation Forest and LOF predictions:\n"
+            "- score_threshold: Adaptive threshold on combined scores (RECOMMENDED)\n"
+            "- weighted_vote: Weight votes by anomaly score strength\n"
+            "- and: Both methods must agree (conservative)\n"
+            "- or: Either method flags it (aggressive, original behavior)"
+        )
+    )
+
+    # Store in session state for access by other functions
+    st.session_state.vote_threshold = vote_threshold
+    st.session_state.ensemble_strategy = ensemble_strategy
 
     # Main content
     tab1, tab2, tab3, tab4 = st.tabs([" Analyze", " Train Model", " Statistics", "ℹ About"])
@@ -514,7 +609,9 @@ def main():
                         st.session_state.detector,
                         st.session_state.preprocessor,
                         contamination,
-                        window_size
+                        window_size,
+                        vote_threshold,
+                        ensemble_strategy
                     )
 
                 if results:
@@ -612,11 +709,15 @@ def main():
                     st.write("**Comparing predictions from Isolation Forest, LOF, and Statistical methods**")
 
                     try:
+                        # Get vote_threshold from session state or use default
+                        vote_threshold = st.session_state.get('vote_threshold', 0.3)
+
                         comparison_figs, agreements = create_multi_method_comparison(
                             df,
                             st.session_state.detector,
                             st.session_state.preprocessor,
-                            window_size
+                            window_size,
+                            vote_threshold
                         )
 
                         # Show agreement metrics

@@ -152,7 +152,7 @@ class LightCurvePreprocessor:
         This is crucial for detecting localized anomalies like transits or flares.
         """
         n_points = len(flux)
-        stride = max(1, window_size // 4)  # 75% overlap
+        stride = max(1, window_size // 2)  # 50% overlap (reduced from 75% to prevent amplification)
         features_list = []
 
         for i in range(0, n_points - window_size + 1, stride):

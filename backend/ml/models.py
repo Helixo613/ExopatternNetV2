@@ -85,13 +85,19 @@ class AnomalyDetector:
 
         return self
 
-    def predict(self, features: np.ndarray, method: str = 'ensemble') -> np.ndarray:
+    def predict(self, features: np.ndarray, method: str = 'ensemble',
+                ensemble_strategy: str = 'score_threshold') -> np.ndarray:
         """
-        Predict anomalies in light curve.
+        Predict anomalies in light curve with configurable ensemble strategy.
 
         Args:
             features: Feature array of shape (n_samples, n_features)
             method: Detection method - 'isolation_forest', 'lof', or 'ensemble'
+            ensemble_strategy: Strategy for combining ensemble predictions:
+                - 'or': Anomaly if EITHER method flags it (aggressive, original behavior)
+                - 'and': Anomaly if BOTH methods agree (conservative)
+                - 'score_threshold': Use combined anomaly scores with adaptive threshold (RECOMMENDED)
+                - 'weighted_vote': Weighted voting based on score strength
 
         Returns:
             Binary array: 1 for anomaly, 0 for normal (or -1/1 for sklearn convention)
@@ -108,21 +114,63 @@ class AnomalyDetector:
             predictions = self.lof.predict(features_scaled)
 
         elif method == 'ensemble':
-            # Combine predictions from both methods
             if_pred = self.isolation_forest.predict(features_scaled)
             lof_pred = self.lof.predict(features_scaled)
 
-            # Anomaly if either method flags it (-1 in sklearn convention)
-            predictions = np.where((if_pred == -1) | (lof_pred == -1), -1, 1)
+            if ensemble_strategy == 'or':
+                # Original aggressive approach - anomaly if EITHER method flags it
+                predictions = np.where((if_pred == -1) | (lof_pred == -1), -1, 1)
+
+            elif ensemble_strategy == 'and':
+                # Conservative approach - both methods must agree
+                predictions = np.where((if_pred == -1) & (lof_pred == -1), -1, 1)
+
+            elif ensemble_strategy == 'weighted_vote':
+                # Weighted voting based on score strength
+                if_scores = self.isolation_forest.score_samples(features_scaled)
+                lof_scores = self.lof.score_samples(features_scaled)
+
+                # Weight by score strength (more negative = more anomalous)
+                if_weight = np.abs(if_scores)
+                lof_weight = np.abs(lof_scores)
+
+                # Weighted vote
+                anomaly_vote = (if_pred == -1) * if_weight + (lof_pred == -1) * lof_weight
+                total_weight = if_weight + lof_weight
+
+                # Anomaly if weighted vote > 50%
+                predictions = np.where(anomaly_vote > total_weight / 2, -1, 1)
+
+            elif ensemble_strategy == 'score_threshold':
+                # Score-based with adaptive threshold (RECOMMENDED)
+                if_scores = self.isolation_forest.score_samples(features_scaled)
+                lof_scores = self.lof.score_samples(features_scaled)
+
+                # Combine scores (average)
+                combined_scores = (if_scores + lof_scores) / 2
+
+                # Use percentile-based threshold instead of fixed contamination
+                # This adapts to the data distribution
+                threshold = np.percentile(combined_scores, self.contamination * 100)
+
+                predictions = np.where(combined_scores < threshold, -1, 1)
+
+            else:
+                raise ValueError(f"Unknown ensemble_strategy: {ensemble_strategy}")
 
         else:
             raise ValueError(f"Unknown method: {method}")
 
         return predictions
 
-    def predict_with_scores(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict_with_scores(self, features: np.ndarray,
+                            ensemble_strategy: str = 'score_threshold') -> Tuple[np.ndarray, np.ndarray]:
         """
         Predict anomalies with anomaly scores.
+
+        Args:
+            features: Feature array
+            ensemble_strategy: Strategy for ensemble voting
 
         Returns:
             predictions: Binary predictions (1/-1)
@@ -140,8 +188,8 @@ class AnomalyDetector:
         # Combine scores (average)
         combined_scores = (if_scores + lof_scores) / 2
 
-        # Get predictions
-        predictions = self.predict(features, method='ensemble')
+        # Get predictions using specified ensemble strategy
+        predictions = self.predict(features, method='ensemble', ensemble_strategy=ensemble_strategy)
 
         return predictions, combined_scores
 
