@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Data — keep samples, exclude downloaded/labeled data
+*.fits
+*.csv
+!data/samples/*.csv
+!data/samples/*.fits
+data/labeled/lightcurves/
+data/labeled/dataset_summary.json
+
+# Model artifacts (large binary files)
+artifacts/
+backend/models/*
+!backend/models/.gitkeep
+
+# Upload folder
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Generated results (reproducible via experiments)
+results/figures/
+results/raw/
+results/tables/
+
+# Notebook outputs (zips, screenshots)
+notebooks/outputs/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Development scratchpad
+CHECKPOINT.md
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Zone.Identifier files (Windows/WSL artifact)
+*:Zone.Identifier
+
+# Screenshots
+*.png
+
+# Temporary files
+/tmp/
+*.tmp
