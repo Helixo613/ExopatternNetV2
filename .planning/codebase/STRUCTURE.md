@@ -1,0 +1,24 @@
+# Structure
+
+- Top-level layout is small and explicit: `backend/`, `frontend/`, `experiments/`, `scripts/`, `data/`, `results/`, and `poster/`.
+- [`backend/`](/home/arnavbansal/ExopatternV3-copy/backend) contains the reusable application logic and is the main code surface for both runtime and experiments.
+- [`backend/api/`](/home/arnavbansal/ExopatternV3-copy/backend/api) contains Flask composition and routes, with `create_app()` defined in [`backend/api/routes.py`](/home/arnavbansal/ExopatternV3-copy/backend/api/routes.py).
+- [`backend/data/`](/home/arnavbansal/ExopatternV3-copy/backend/data) contains data acquisition and file loading; it is responsible for both local files and remote astronomy data.
+- [`backend/ml/`](/home/arnavbansal/ExopatternV3-copy/backend/ml) is the dense part of the tree and holds preprocessing, model wrappers, evaluation, training, and figure generation.
+- [`backend/models/`](/home/arnavbansal/ExopatternV3-copy/backend/models) stores persisted sklearn/joblib artifacts grouped by `default_model/` and `trained_model/`.
+- [`backend/uploads/`](/home/arnavbansal/ExopatternV3-copy/backend/uploads) is a scratch area for API-uploaded files before parsing and cleanup.
+- [`frontend/app.py`](/home/arnavbansal/ExopatternV3-copy/frontend/app.py) is a single-file Streamlit app; there is no frontend component tree or subpackage.
+- [`experiments/`](/home/arnavbansal/ExopatternV3-copy/experiments) contains the paper-oriented workflow, with config in [`experiments/config.py`](/home/arnavbansal/ExopatternV3-copy/experiments/config.py) and orchestration in [`experiments/run_experiments.py`](/home/arnavbansal/ExopatternV3-copy/experiments/run_experiments.py).
+- [`scripts/download_dataset.py`](/home/arnavbansal/ExopatternV3-copy/scripts/download_dataset.py) is the main CLI utility for building labeled datasets from MAST.
+- [`data/samples/`](/home/arnavbansal/ExopatternV3-copy/data/samples) contains small synthetic fixtures used for smoke tests and demo usage.
+- [`data/labeled/`](/home/arnavbansal/ExopatternV3-copy/data/labeled) contains downloaded Kepler lightcurves and metadata; it is the local benchmark dataset used by experiments.
+- [`results/figures/`](/home/arnavbansal/ExopatternV3-copy/results/figures), [`results/raw/`](/home/arnavbansal/ExopatternV3-copy/results/raw), and [`results/tables/`](/home/arnavbansal/ExopatternV3-copy/results/tables) separate visual, numeric, and LaTeX outputs.
+- [`notebooks/kaggle/`](/home/arnavbansal/ExopatternV3-copy/notebooks/kaggle) holds the longer-running research notebooks, numbered by workflow stage.
+- [`notebooks/outputs/`](/home/arnavbansal/ExopatternV3-copy/notebooks/outputs) stores packaged zip artifacts from notebook runs.
+- [`poster/`](/home/arnavbansal/ExopatternV3-copy/poster) is self-contained static HTML/CSS for the academic poster.
+- Naming is mostly domain-driven: files are named by responsibility (`loader`, `acquisition`, `preprocessing`, `evaluation`, `training`, `model_registry`) rather than by feature or use case.
+- Entry points follow the same naming style: `app.py` for runtime servers, `run_experiments.py` for batch execution, and `download_dataset.py` for CLI acquisition.
+- The codebase does not use nested app folders like `src/` or `app/`; import paths are rooted directly at the repository top level.
+- Notebook stages are numbered to imply order, and the current pipeline references them as acquisition, feature engineering, classical training, experiments, and deep learning.
+- Files under `backend/ml/` are logically split by concern, but the public API is exposed mostly through [`backend/ml/__init__.py`](/home/arnavbansal/ExopatternV3-copy/backend/ml/__init__.py) for convenience imports.
+- The repo keeps research outputs and code adjacent, which makes it easy to inspect artifacts but also means the map should be read together with `results/` and `artifacts/models/` rather than code alone.

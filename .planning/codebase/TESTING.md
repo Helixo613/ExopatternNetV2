@@ -1,0 +1,33 @@
+# Testing and Validation
+
+- There is no dedicated `tests/` directory in the repository and no visible `pytest` or `unittest` suite.
+- Validation is currently performed through scripts, notebooks, and generated artifacts rather than automated tests.
+- The main executable entry points are `backend/app.py`, `frontend/app.py`, `scripts/download_dataset.py`, and `experiments/run_experiments.py`.
+- `run.sh` and `run_wsl.sh` provide environment bootstrap and Streamlit launch paths, which act as smoke tests for installation and import health.
+- `generate_sample_data.py` is the simplest local validation path because it creates known synthetic CSV and FITS examples in `data/samples/`.
+- The project relies on notebook-based validation in `notebooks/kaggle/`, especially the data acquisition, model training, deep learning, and experiments notebooks.
+- `scripts/download_dataset.py --smoke-test` is the closest thing to an integration test for the data acquisition pipeline.
+- The local labeled dataset in `data/labeled/` is very small, so it is only useful for smoke testing, not for scientific evaluation.
+- `experiments/run_experiments.py` is the primary validation harness for the research pipeline and produces JSON, LaTeX, and PDF outputs in `results/`.
+- `experiments/hyperparameter_tuning.py` provides grid-search style validation, but it still depends on the same evaluation code rather than an isolated test suite.
+- `backend/ml/evaluation.py` is the central metrics module and is the logical place for future unit tests around scoring, cross-validation, bootstrap CIs, and statistical tests.
+- `backend/data/loader.py` is a strong candidate for unit tests around FITS/CSV parsing, delimiter detection, and missing-column handling.
+- `backend/ml/preprocessing.py` is another high-value test target because sigma clipping, interpolation, and sliding windows can silently shift labels or drop rows.
+- `backend/ml/models.py` should be tested for score-sign consistency and window-to-point mapping logic, especially `map_window_predictions_to_points()`.
+- `backend/ml/baselines.py` needs regression tests for model wrappers, particularly the BLS fallback behavior and the unified `fit/predict/score_samples` interface.
+- `backend/ml/model_registry.py` should be tested for correct factory resolution and artifact loading behavior.
+- `backend/api/routes.py` would benefit from endpoint tests for `/health`, `/api/analyze`, `/api/train`, `/api/export`, and `/api/evaluate`.
+- The current codebase uses manual logging and exception handling as the main failure signal, so failures are easier to detect in logs than in assertions.
+- There is no obvious CI configuration in the repository, so test execution is likely manual or notebook-driven.
+- The strongest validation artifacts currently committed are the generated result files in `results/` and the packaged notebook outputs in `notebooks/outputs/`.
+- `results/raw/experiment_1_model_comparison.json` and `results/tables/model_comparison.tex` are the best evidence that the pipeline can run end-to-end.
+- The project currently depends on external astronomy services, so tests are partly constrained by network availability and third-party API stability.
+- `backend/data/acquisition.py` should be treated as an integration boundary because it touches MAST, `astroquery`, and `lightkurve`.
+- `backend/ml/deep_models.py` should have explicit validation around TensorFlow availability, model load/save paths, and threshold recalibration.
+- `frontend/app.py` is not covered by automated tests and instead depends on manual UI verification through Streamlit.
+- A future test harness should separate deterministic pure-function tests from networked or notebook-based integration checks.
+- Current coverage gaps include label-alignment regression tests, event-level metric tests, calibration tests, and artifact-load tests.
+- Another gap is version-pinned reproducibility testing for serialized models under `artifacts/models/` and `backend/models/`.
+- Because the codebase is research-oriented, a useful test strategy is “small deterministic unit tests plus a few expensive pipeline smoke tests”.
+- For the Phase 1 refactor, the most important tests will be around star grouping, candidate generation, ground-truth event matching, and score standardization.
+- If future automated tests are added, they should live close to the logic they validate and use the same domain terms as the codebase.

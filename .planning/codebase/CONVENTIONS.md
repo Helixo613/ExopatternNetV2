@@ -1,0 +1,32 @@
+# Code Conventions
+
+- The project is a Python-first codebase with a standard package layout under `backend/`, `experiments/`, `frontend/`, and `scripts/`.
+- Module docstrings are used consistently to describe intent at the top of most files, for example `backend/ml/preprocessing.py` and `backend/data/loader.py`.
+- Type hints are used selectively in core ML and evaluation modules, especially in `backend/ml/evaluation.py`, `backend/ml/models.py`, and `backend/data/acquisition.py`.
+- Logging is the dominant observability pattern. Most modules create a module-level logger with `logging.getLogger(__name__)`.
+- Log levels are used conventionally: `info` for lifecycle milestones, `warning` for degraded or fallback behavior, and `error` for failures.
+- Exception handling is pragmatic rather than formal. Many functions raise `ValueError`, `FileNotFoundError`, or `ImportError` with direct human-readable messages.
+- Several places use broad exception handlers, including `backend/api/routes.py` and `frontend/app.py`; those are convenient but make root-cause analysis harder.
+- The code favors explicit procedural pipelines over deep abstractions. Examples include `ModelTrainer` in `backend/ml/training.py` and `ExperimentRunner` in `experiments/run_experiments.py`.
+- Scientific and ML data flow is generally “load -> preprocess -> feature extraction -> fit/predict -> evaluate”.
+- Naming is mostly snake_case for functions, variables, and files; class names use PascalCase, such as `LightCurveLoader`, `AnomalyDetector`, and `PaperFigureGenerator`.
+- Constants are upper-case and grouped near the top of files, such as `COLORS` in `frontend/app.py` and `HYPERPARAM_GRIDS` in `experiments/config.py`.
+- The code uses the sklearn convention of `-1` for anomaly and `1` for normal in many model wrappers, especially in `backend/ml/baselines.py` and `backend/ml/models.py`.
+- `backend/ml/evaluation.py` converts raw model outputs into binary labels before computing metrics, which is a recurring normalization step.
+- Preprocessing is centralized in `backend/ml/preprocessing.py`, which keeps feature extraction logic in one place rather than scattering it across the UI or experiments.
+- The project favors local helper methods with underscores, such as `_sigma_clip`, `_normalize_flux`, `_extract_statistical_features`, and `_save_json`.
+- Fallback behavior is common. If a pretrained model is missing, the frontend falls back to synthetic training in `frontend/app.py`.
+- The API layer in `backend/api/routes.py` exposes clearly named REST endpoints and uses JSON responses with `success`, `error`, and `traceback` fields.
+- File and directory names are descriptive and domain-specific rather than generic.
+- Generated artifacts are kept out of source control via `.gitignore`, especially `artifacts/`, `results/`, and `backend/uploads/`.
+- Markdown documentation and notebook outputs are treated as first-class project outputs, not just commentary.
+- The codebase mixes research code and application code in the same repository, so consistency matters more than strict layering purity.
+- There is little evidence of automated formatting enforcement, so local style should be inferred from surrounding code rather than from a formatter config.
+- The dominant style is readable, explicit, and notebook-friendly rather than highly abstract or “framework heavy”.
+- Public interfaces tend to be simple and synchronous, which keeps the pipeline easy to inspect and debug.
+- When adding new code, match the existing directness: short docstrings, explicit error messages, and minimal indirection.
+- When adding new modules, prefer naming that mirrors the domain role, for example `event_evaluation.py`, `multi_view.py`, or `tls_features.py`.
+- For new feature groups, extend `backend/ml/feature_names.py` rather than redefining feature names elsewhere.
+- For new pipeline state, keep the state in returned objects or small dataclasses rather than mutable globals.
+- For new docs or outputs, include concrete file paths in backticks so the repository can be navigated quickly.
+
