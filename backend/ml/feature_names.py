@@ -36,7 +36,24 @@ GLOBAL_FEATURE_GROUPS = {
         'ls_max_power', 'ls_dominant_period', 'ls_second_power',
         'ls_power_ratio', 'bls_power', 'bls_period', 'bls_duration',
     ],
+    # TLS global features: constant per star, appended to every window.
+    # Registered here for ablation tracking and SHAP labelling.
+    'tls': [
+        'tls_sde',
+        'tls_period',
+        'tls_depth',
+        'tls_duration',
+        'tls_odd_even',
+        'tls_snr',
+    ],
 }
+
+# TLS event-consistency features (per-candidate, not per-window)
+TLS_CONSISTENCY_FEATURES = [
+    'tls_epoch_distance',
+    'tls_phase_agreement',
+    'tls_depth_ratio',
+]
 
 # Default groups used when no feature_groups parameter is specified
 DEFAULT_GROUPS = ['statistical', 'frequency', 'wavelet', 'autocorrelation', 'shape']

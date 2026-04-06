@@ -12,7 +12,7 @@ Supports ~45 features per window across 5 groups:
 import numpy as np
 import pandas as pd
 from scipy import signal, stats
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,13 +52,18 @@ class LightCurvePreprocessor:
         return df
 
     def _sigma_clip(self, df: pd.DataFrame, sigma: float = 5) -> pd.DataFrame:
-        """Remove extreme outliers using sigma clipping."""
+        """Remove extreme outliers using sigma clipping.
+
+        IMPORTANT: returns a DataFrame with a reset index so that downstream
+        integer-positional indexing (e.g. label slicing) stays aligned with
+        the clipped row positions.
+        """
         flux = df['flux'].values
         median = np.median(flux)
         std = np.std(flux)
 
         mask = np.abs(flux - median) < sigma * std
-        clipped_df = df[mask].copy()
+        clipped_df = df[mask].copy().reset_index(drop=True)
 
         n_removed = len(df) - len(clipped_df)
         if n_removed > 0:
@@ -159,6 +164,99 @@ class LightCurvePreprocessor:
             features_list.append(feat)
 
         return np.array(features_list)
+
+    def extract_features_with_metadata(
+        self,
+        df: pd.DataFrame,
+        star_id: str,
+        window_size: int = 50,
+        feature_groups: Optional[List[str]] = None,
+        labels: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+        """
+        Extract features AND return per-window metadata and labels.
+
+        Unlike extract_features(), this function:
+        - preserves star_id, window time range, and positional indices per window
+        - correctly aligns labels to the post-sigma-clip DataFrame positions
+          (the label array must correspond to the already-clipped df rows)
+
+        Args:
+            df: Preprocessed (already sigma-clipped + normalised) DataFrame
+                with columns time, flux. Row index must be 0-based after clipping.
+            star_id: Identifier for this star (used for star-level CV grouping).
+            window_size: Sliding window size in cadences.
+            feature_groups: Feature groups to extract (default: all 5).
+            labels: Per-point label array aligned to df rows (0=normal, 1=anomaly).
+                    If None, window labels are returned as all-zero.
+
+        Returns:
+            features:  np.ndarray of shape (n_windows, n_features)
+            win_labels: np.ndarray of shape (n_windows,) — 1 if any point in
+                        window is labelled anomalous, else 0
+            metadata:  list of dicts, one per window:
+                       {star_id, window_idx, start_idx, end_idx,
+                        start_time, end_time, center_time}
+        """
+        if feature_groups is None:
+            feature_groups = ['statistical', 'frequency', 'wavelet',
+                              'autocorrelation', 'shape']
+
+        flux = df['flux'].values
+        time = df['time'].values
+        n_points = len(flux)
+        stride = max(1, window_size // 4)
+
+        if labels is None:
+            labels = np.zeros(n_points, dtype=int)
+        else:
+            labels = np.asarray(labels, dtype=int)
+            if len(labels) != n_points:
+                raise ValueError(
+                    f"labels length {len(labels)} != df length {n_points}. "
+                    "Pass labels that are already aligned to the clipped DataFrame."
+                )
+
+        features_list: List[List[float]] = []
+        win_labels_list: List[int] = []
+        metadata_list: List[Dict[str, Any]] = []
+
+        window_idx = 0
+        for i in range(0, n_points - window_size + 1, stride):
+            window_flux = flux[i:i + window_size]
+            window_time = time[i:i + window_size]
+            window_lab = labels[i:i + window_size]
+
+            feat: List[float] = []
+            if 'statistical' in feature_groups:
+                feat.extend(self._extract_statistical_features(window_flux, window_time))
+            if 'frequency' in feature_groups:
+                feat.extend(self._extract_frequency_features(window_flux, window_time))
+            if 'wavelet' in feature_groups:
+                feat.extend(self._extract_wavelet_features(window_flux))
+            if 'autocorrelation' in feature_groups:
+                feat.extend(self._extract_autocorrelation_features(window_flux))
+            if 'shape' in feature_groups:
+                feat.extend(self._extract_shape_features(window_flux))
+
+            features_list.append(feat)
+            win_labels_list.append(int(window_lab.max() > 0))
+            metadata_list.append({
+                'star_id': star_id,
+                'window_idx': window_idx,
+                'start_idx': i,
+                'end_idx': i + window_size - 1,
+                'start_time': float(window_time[0]),
+                'end_time': float(window_time[-1]),
+                'center_time': float(np.mean(window_time)),
+            })
+            window_idx += 1
+
+        return (
+            np.array(features_list),
+            np.array(win_labels_list, dtype=int),
+            metadata_list,
+        )
 
     def _extract_statistical_features(self, flux: np.ndarray,
                                        time: np.ndarray) -> List[float]:
