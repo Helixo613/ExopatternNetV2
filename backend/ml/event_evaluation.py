@@ -106,6 +106,58 @@ def compute_ground_truth_events(
     return events
 
 
+def compute_ground_truth_events_from_dfs(
+    metadata_df: pd.DataFrame,
+    dfs: Dict[str, 'pd.DataFrame'],
+    buffer_days: float = GT_BUFFER_DAYS,
+) -> Dict[str, List[GroundTruthEvent]]:
+    """
+    Compute GT events from already-loaded DataFrames — avoids re-reading CSVs.
+
+    Args:
+        metadata_df: DataFrame from metadata.csv with columns:
+                     target_id, period, epoch, duration_hours
+        dfs: already-loaded light curve DataFrames {star_id -> DataFrame}
+        buffer_days: padding on each side of a transit window
+
+    Returns:
+        dict mapping star_id -> list of GroundTruthEvent
+    """
+    gt_events: Dict[str, List[GroundTruthEvent]] = {}
+
+    for _, row in metadata_df.iterrows():
+        star_id = str(row['target_id'])
+        df = dfs.get(star_id)
+        if df is None:
+            gt_events[star_id] = []
+            continue
+        period = row['period']
+        epoch = row['epoch']
+        duration_hours = row['duration_hours']
+        if pd.isna(period) or pd.isna(epoch) or pd.isna(duration_hours):
+            # Normal stars in metadata.csv do not have transit ephemerides.
+            # Treat them as having no GT events instead of logging warnings.
+            gt_events[star_id] = []
+            logger.debug(f"{star_id}: no ephemeris available; GT events skipped")
+            continue
+        try:
+            events = compute_ground_truth_events(
+                star_id=star_id,
+                time=df['time'].values,
+                period=float(period),
+                epoch=float(epoch),
+                duration_hours=float(duration_hours),
+                buffer_days=buffer_days,
+            )
+            gt_events[star_id] = events
+            logger.debug(f"{star_id}: {len(events)} ground truth transit events")
+        except Exception as e:
+            logger.warning(f"Could not compute ground truth for {star_id}: {e}")
+            gt_events[star_id] = []
+
+    return gt_events
+
+
 def load_ground_truth_events(
     metadata_csv: str,
     lightcurve_dir: str,
@@ -123,14 +175,21 @@ def load_ground_truth_events(
     for _, row in meta.iterrows():
         star_id = str(row['target_id'])
         lc_path = f"{lightcurve_dir}/{row['filename']}"
+        period = row['period']
+        epoch = row['epoch']
+        duration_hours = row['duration_hours']
+        if pd.isna(period) or pd.isna(epoch) or pd.isna(duration_hours):
+            gt_events[star_id] = []
+            logger.debug(f"{star_id}: no ephemeris available; GT events skipped")
+            continue
         try:
             df = pd.read_csv(lc_path)
             events = compute_ground_truth_events(
                 star_id=star_id,
                 time=df['time'].values,
-                period=float(row['period']),
-                epoch=float(row['epoch']),
-                duration_hours=float(row['duration_hours']),
+                period=float(period),
+                epoch=float(epoch),
+                duration_hours=float(duration_hours),
                 buffer_days=buffer_days,
             )
             gt_events[star_id] = events
@@ -159,8 +218,8 @@ def match_events(
         (a) candidate center falls inside the buffered GT interval, OR
         (b) time overlap > overlap_fraction * GT duration
 
-    One-to-one: each GT event is claimed by at most one candidate (highest
-    composite_score). Each candidate can match at most one GT event.
+      One-to-one: each GT event is claimed by at most one candidate (highest
+    ranking statistic). Each candidate can match at most one GT event.
 
     Args:
         candidates: list of CandidateEvent (all from the same star)
@@ -178,9 +237,9 @@ def match_events(
     if not candidates:
         return [], [], [], list(gt_events)
 
-    # Sort candidates by composite_score descending so highest-scoring
+    # Sort candidates by final ranking score descending so highest-scoring
     # candidate gets first claim on each GT event
-    sorted_cands = sorted(candidates, key=lambda c: c.composite_score, reverse=True)
+    sorted_cands = sorted(candidates, key=_candidate_score, reverse=True)
 
     claimed_gt: set = set()     # indices of GT events already claimed
     tp_candidates: List[CandidateEvent] = []
@@ -215,6 +274,10 @@ def _find_matching_gt(
     best_overlap: float = -1.0
 
     for i, gt in enumerate(gt_events):
+        # Guard: never match across stars — Kepler time ranges overlap between stars
+        if gt.star_id != cand.star_id:
+            continue
+
         # Rule (a): candidate center inside buffered GT interval
         center_inside = gt.start_time <= cand.center_time <= gt.end_time
 
@@ -290,7 +353,7 @@ def event_metrics(
         candidates, gt_events, K, overlap_fraction
     )
 
-    # AU-PR (event level) — sweep threshold over all composite scores
+    # AU-PR (event level) — sweep threshold over the final ranking statistic
     au_pr = _event_au_pr(candidates, gt_events, overlap_fraction)
 
     return {
@@ -318,12 +381,11 @@ def _recall_at_k(
     if not candidates or not gt_events:
         return 0.0, 0.0
 
-    top_k = sorted(candidates, key=lambda c: c.composite_score, reverse=True)[:K]
-    _, _, detected_gt, _ = match_events(top_k, gt_events, overlap_fraction)
+    top_k = sorted(candidates, key=_candidate_score, reverse=True)[:K]
+    tp_candidates, _, detected_gt, _ = match_events(top_k, gt_events, overlap_fraction)
 
     recall_at_k    = len(detected_gt) / len(gt_events)
-    precision_at_k = len([c for c in top_k
-                           if _find_matching_gt(c, gt_events, overlap_fraction) is not None]) / max(K, 1)
+    precision_at_k = len(tp_candidates) / max(len(top_k), 1)
     return recall_at_k, precision_at_k
 
 
@@ -335,29 +397,31 @@ def _event_au_pr(
     """
     Area under the event-level Precision-Recall curve.
 
-    Sweeps the composite score threshold from high to low, adding one
+    Sweeps the final ranking score threshold from high to low, adding one
     candidate at a time (ranked by score), and records (precision, recall)
     at each step.
     """
     if not candidates or not gt_events:
         return 0.0
 
-    sorted_cands = sorted(candidates, key=lambda c: c.composite_score, reverse=True)
+    sorted_cands = sorted(candidates, key=_candidate_score, reverse=True)
     n_gt = len(gt_events)
 
     precisions = [1.0]
     recalls    = [0.0]
 
-    for i in range(1, len(sorted_cands) + 1):
-        subset = sorted_cands[:i]
-        _, _, detected_gt, _ = match_events(subset, gt_events, overlap_fraction)
-        n_detected = len(detected_gt)
-        n_tp = sum(
-            1 for c in subset
-            if _find_matching_gt(c, gt_events, overlap_fraction) is not None
-        )
+    # Incremental O(N) sweep: process candidates in score order, check only
+    # the new candidate at each step instead of re-scanning the full prefix.
+    claimed_gt: set = set()   # GT indices already claimed by a higher-scoring cand
+    n_tp = 0
+
+    for i, cand in enumerate(sorted_cands, 1):
+        gt_idx = _find_matching_gt(cand, gt_events, overlap_fraction)
+        if gt_idx is not None and gt_idx not in claimed_gt:
+            claimed_gt.add(gt_idx)
+            n_tp += 1
         p = n_tp / i
-        r = n_detected / n_gt
+        r = len(claimed_gt) / n_gt
         precisions.append(p)
         recalls.append(r)
 
@@ -384,25 +448,24 @@ def event_pr_curve(
     if not candidates or not gt_events:
         return np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([])
 
-    sorted_cands = sorted(candidates, key=lambda c: c.composite_score, reverse=True)
+    sorted_cands = sorted(candidates, key=_candidate_score, reverse=True)
     n_gt = len(gt_events)
 
     precisions_list = []
     recalls_list    = []
     thresholds_list = []
 
-    for i in range(1, len(sorted_cands) + 1):
-        subset = sorted_cands[:i]
-        _, _, detected_gt, _ = match_events(subset, gt_events, overlap_fraction)
-        n_tp = sum(
-            1 for c in subset
-            if _find_matching_gt(c, gt_events, overlap_fraction) is not None
-        )
-        p = n_tp / i
-        r = len(detected_gt) / n_gt
-        precisions_list.append(p)
-        recalls_list.append(r)
-        thresholds_list.append(sorted_cands[i - 1].composite_score)
+    claimed_gt: set = set()
+    n_tp = 0
+
+    for i, cand in enumerate(sorted_cands, 1):
+        gt_idx = _find_matching_gt(cand, gt_events, overlap_fraction)
+        if gt_idx is not None and gt_idx not in claimed_gt:
+            claimed_gt.add(gt_idx)
+            n_tp += 1
+        precisions_list.append(n_tp / i)
+        recalls_list.append(len(claimed_gt) / n_gt)
+        thresholds_list.append(_candidate_score(cand))
 
     return (
         np.array(precisions_list),
@@ -440,3 +503,10 @@ def aggregate_event_metrics(per_fold_metrics: List[Dict]) -> Dict:
             agg[f'{key}_mean'] = float('nan')
             agg[f'{key}_std']  = float('nan')
     return agg
+
+
+def _candidate_score(candidate: CandidateEvent) -> float:
+    """Return the statistic used for final ranking/evaluation."""
+    if candidate.ranking_score is not None:
+        return float(candidate.ranking_score)
+    return float(candidate.composite_score)

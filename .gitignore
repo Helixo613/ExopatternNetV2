@@ -57,6 +57,13 @@ backend/uploads/*
 results/figures/
 results/raw/
 results/tables/
+results/paper/feature_store/
+results/paper/raw/
+results/paper/*.log
+results/paper/tls_cache.json
+results/paper/post_tls_report.json
+results/paper/post_tls_report.md
+results/paper/all_results.json
 
 # Notebook outputs (zips, screenshots)
 notebooks/outputs/

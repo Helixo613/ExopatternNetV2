@@ -10,8 +10,13 @@ from typing import List, Dict, Optional, Tuple
 import logging
 import json
 import time as time_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 logger = logging.getLogger(__name__)
+
+# Thread-local storage for lightkurve imports (avoids contention)
+_thread_local = threading.local()
 
 
 class MastDataAcquisitor:
@@ -21,10 +26,29 @@ class MastDataAcquisitor:
     NASA Exoplanet Archive.
     """
 
-    def __init__(self, output_dir: str = 'data/labeled'):
+    def __init__(self, output_dir: str = 'data/labeled', enable_cloud: bool = True):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / 'lightcurves').mkdir(exist_ok=True)
+
+        # Enable S3 cloud downloads — MAST data served from AWS public bucket
+        # (free, no credentials needed, much faster than MAST file servers)
+        if enable_cloud:
+            try:
+                from astroquery.mast import Observations
+                import sys
+                # Only enable S3 cloud in interactive (TTY) mode.
+                # In parallel/background runs the astropy ProgressBarOrSpinner writes
+                # to stdout from worker threads, which crashes with "I/O operation on
+                # closed file" when stdout is redirected.
+                if sys.stdout.isatty():
+                    Observations.enable_cloud_dataset()
+                    logger.info("S3 cloud downloads enabled (AWS public Kepler bucket)")
+                else:
+                    logger.info("Non-TTY detected — using MAST file servers (avoids S3 progress bar crash)")
+            except Exception as e:
+                logger.warning(f"Could not enable S3 cloud downloads: {e}. "
+                               "Falling back to MAST file servers.")
 
     def query_confirmed_planets(self, max_targets: int = 150,
                                  mission: str = 'Kepler') -> pd.DataFrame:
@@ -116,23 +140,42 @@ class MastDataAcquisitor:
         except Exception:
             exclude_names = set()
 
-        # For Kepler, use a catalog of quiet stars
-        # We'll search for stars in a magnitude range and filter out planet hosts
+        # For Kepler, query the Kepler Input Catalog (KIC) via MAST Catalogs
+        non_planet_ids = []
         if mission.lower() == 'kepler':
-            # Search for generic Kepler targets
-            search_results = lk.search_lightcurve(
-                f"KIC",
-                mission="Kepler",
-                cadence="long",
-            )
-            # This is a broad search; we'll pick from available targets
-            # In practice, for a real dataset build, use the Kepler Input Catalog
-            non_planet_ids = []
-            if len(search_results) > 0:
-                unique_targets = search_results.table['target_name']
-                for target in unique_targets:
-                    if target not in exclude_names and len(non_planet_ids) < n_stars:
-                        non_planet_ids.append(target)
+            try:
+                from astroquery.mast import Catalogs
+                kic = Catalogs.query_criteria(
+                    catalog="Kic",
+                    kp_min=mag_range[0],
+                    kp_max=mag_range[1],
+                    columns=["kic_kepler_id", "kic_kepmag"],
+                )
+                kic_df = kic.to_pandas()
+                # Shuffle so we get a varied sample
+                kic_df = kic_df.sample(frac=1, random_state=42).reset_index(drop=True)
+                for _, krow in kic_df.iterrows():
+                    kid = f"KIC {int(krow['kic_kepler_id'])}"
+                    if kid not in exclude_names and len(non_planet_ids) < n_stars * 3:
+                        non_planet_ids.append(kid)
+            except Exception as e:
+                logger.warning(f"KIC catalog query failed: {e}. "
+                               "Falling back to hardcoded quiet-star list.")
+                # Fallback: verified Kepler asteroseismology solar-type stars
+                # All confirmed to have 15-18 quarters of long-cadence data on MAST
+                _fallback_kic = [
+                    "KIC 3544595", "KIC 4914423", "KIC 6196457", "KIC 6278762",
+                    "KIC 6603624", "KIC 7103006", "KIC 7206837", "KIC 7670943",
+                    "KIC 8379927", "KIC 8694723", "KIC 9139151", "KIC 9139163",
+                    "KIC 9206432", "KIC 9353712", "KIC 9812850", "KIC 10516096",
+                    "KIC 10644253", "KIC 10963065", "KIC 11244118", "KIC 11295426",
+                    "KIC 12009504", "KIC 12258514", "KIC 4351319", "KIC 5184732",
+                    "KIC 6116048", "KIC 6225718", "KIC 6442183", "KIC 7680114",
+                    "KIC 8006161", "KIC 8150065", "KIC 8179536", "KIC 8524425",
+                ]
+                for kid in _fallback_kic:
+                    if kid not in exclude_names:
+                        non_planet_ids.append(kid)
 
         result = pd.DataFrame({
             'target_id': non_planet_ids[:n_stars],
@@ -170,6 +213,8 @@ class MastDataAcquisitor:
         logger.info(f"Downloading light curve for {target_id} ({mission})...")
 
         try:
+            import socket
+            socket.setdefaulttimeout(120)  # 2-min hard timeout — prevents hung connections
             search = lk.search_lightcurve(target_id, mission=mission, cadence="long")
 
             if len(search) == 0:
@@ -409,6 +454,198 @@ class MastDataAcquisitor:
             'non_planet': len([m for m in all_metadata if m['label_type'] == 'normal']),
             'total_points': sum(m['n_points'] for m in all_metadata),
             'mission': mission,
+        }
+        with open(self.output_dir / 'dataset_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        logger.info(f"Dataset complete: {summary}")
+        return metadata_df
+
+    def build_dataset_fast(self, n_planet_hosts: int = 150, n_non_planet: int = 100,
+                           mission: str = 'Kepler', n_workers: int = 8,
+                           max_quarters: Optional[int] = None) -> pd.DataFrame:
+        """
+        Optimized parallel dataset builder.
+
+        Speed gains over build_dataset():
+          1. S3 cloud downloads (enabled in __init__)
+          2. Parallel search+download across n_workers threads
+          3. Resume support — skips already-downloaded stars
+          4. No inter-download delay (S3 handles concurrency fine)
+
+        Args:
+            n_planet_hosts: Number of planet-hosting stars
+            n_non_planet: Number of non-planet stars
+            mission: 'Kepler' or 'TESS'
+            n_workers: Parallel download threads (default 8)
+            max_quarters: Max quarters per star (None = all)
+
+        Returns:
+            metadata DataFrame
+        """
+        # --- 1. Query target lists (fast, single API call each) ---
+        logger.info(f"=== Fast parallel download: {n_planet_hosts} planets + {n_non_planet} normal ===")
+
+        planet_targets = pd.DataFrame()
+        non_planet_targets = pd.DataFrame()
+
+        try:
+            planet_targets = self.query_confirmed_planets(
+                max_targets=n_planet_hosts, mission=mission
+            )
+        except Exception as e:
+            logger.error(f"Failed to query planet hosts: {e}")
+
+        try:
+            non_planet_targets = self.query_non_planet_stars(
+                n_stars=n_non_planet, mission=mission
+            )
+        except Exception as e:
+            logger.error(f"Failed to query non-planet stars: {e}")
+
+        all_targets = pd.concat([planet_targets, non_planet_targets], ignore_index=True)
+        total = len(all_targets)
+        logger.info(f"Total targets to process: {total}")
+
+        # --- 2. Check for already-downloaded stars (resume support) ---
+        lc_dir = self.output_dir / 'lightcurves'
+        existing = set()
+        for f in lc_dir.glob('*.csv'):
+            existing.add(f.stem.replace('_', ' '))
+
+        to_download = []
+        already_done_meta = []
+        for _, row in all_targets.iterrows():
+            tid = row['target_id']
+            if tid in existing or tid.replace(' ', '_') in existing:
+                logger.info(f"  Skipping {tid} (already downloaded)")
+                # Rebuild metadata from existing file
+                safe_name = tid.replace(' ', '_').replace('+', 'p')
+                filename = f"{safe_name}.csv"
+                fpath = lc_dir / filename
+                if fpath.exists():
+                    df = pd.read_csv(fpath)
+                    has_planet = pd.notna(row.get('period'))
+                    meta = {
+                        'target_id': tid, 'mission': mission,
+                        'n_points': len(df),
+                        'label_type': 'transit' if has_planet else 'normal',
+                        'n_anomalies': int(df['label'].sum()) if 'label' in df.columns else 0,
+                        'anomaly_fraction': float(df['label'].mean()) if 'label' in df.columns else 0.0,
+                        'filename': filename,
+                    }
+                    if has_planet:
+                        meta.update({
+                            'planet_name': row.get('planet_name'),
+                            'period': float(row['period']),
+                            'epoch': float(row['epoch']),
+                            'duration_hours': float(row['duration_hours']),
+                            'depth_ppm': float(row.get('depth_ppm', 0)),
+                        })
+                    already_done_meta.append(meta)
+            else:
+                to_download.append(row)
+
+        logger.info(f"Already downloaded: {len(already_done_meta)}, remaining: {len(to_download)}")
+
+        if not to_download:
+            logger.info("All targets already downloaded!")
+            metadata_df = pd.DataFrame(already_done_meta)
+            metadata_df.to_csv(self.output_dir / 'metadata.csv', index=False)
+            return metadata_df
+
+        # --- 3. Parallel download + label ---
+        all_metadata = list(already_done_meta)
+        completed = len(already_done_meta)
+        failed = []
+        lock = threading.Lock()
+
+        def _download_one(row):
+            """Download and label a single target (runs in worker thread)."""
+            tid = row['target_id']
+            for attempt in range(3):
+                try:
+                    # Run the actual download in a daemon thread with a hard timeout.
+                    # This is the only reliable way to abort a hung urllib/boto3 transfer
+                    # since socket.setdefaulttimeout only covers connect, not read stalls.
+                    _result = [None]
+                    _error = [None]
+
+                    def _do():
+                        try:
+                            _result[0] = self.download_and_label_target(
+                                row, save=True, max_quarters=max_quarters
+                            )
+                        except Exception as e:
+                            _error[0] = e
+
+                    t = threading.Thread(target=_do, daemon=True)
+                    t.start()
+                    t.join(timeout=600)  # 10-min hard cap per attempt
+
+                    if t.is_alive():
+                        logger.warning(f"Attempt {attempt+1} timed out (600s) for {tid} — retrying")
+                        continue
+                    if _error[0]:
+                        raise _error[0]
+                    if _result[0] is not None:
+                        return _result[0]['metadata']
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt+1} failed for {tid}: {e}")
+                    time_module.sleep(1)
+            return None
+
+        logger.info(f"Starting parallel download with {n_workers} workers...")
+        t0 = time_module.time()
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_to_target = {
+                executor.submit(_download_one, row): row['target_id']
+                for row in to_download
+            }
+
+            for future in as_completed(future_to_target):
+                tid = future_to_target[future]
+                try:
+                    meta = future.result()
+                    with lock:
+                        if meta is not None:
+                            all_metadata.append(meta)
+                            completed += 1
+                            elapsed = time_module.time() - t0
+                            rate = completed / elapsed if elapsed > 0 else 0
+                            eta = (total - completed) / rate if rate > 0 else 0
+                            logger.info(
+                                f"[{completed}/{total}] {tid} OK "
+                                f"({meta['n_points']} pts) "
+                                f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]"
+                            )
+                        else:
+                            failed.append(tid)
+                            logger.warning(f"[FAILED] {tid}")
+                except Exception as e:
+                    failed.append(tid)
+                    logger.error(f"[ERROR] {tid}: {e}")
+
+        elapsed_total = time_module.time() - t0
+        logger.info(
+            f"\nDownload complete in {elapsed_total:.0f}s "
+            f"({len(all_metadata)} OK, {len(failed)} failed)"
+        )
+        if failed:
+            logger.warning(f"Failed targets: {failed}")
+
+        # --- 4. Save metadata ---
+        metadata_df = pd.DataFrame(all_metadata)
+        metadata_df.to_csv(self.output_dir / 'metadata.csv', index=False)
+
+        summary = {
+            'total_targets': len(all_metadata),
+            'planet_hosts': len([m for m in all_metadata if m['label_type'] == 'transit']),
+            'non_planet': len([m for m in all_metadata if m['label_type'] == 'normal']),
+            'total_points': sum(m['n_points'] for m in all_metadata),
+            'mission': mission,
+            'download_time_seconds': elapsed_total,
         }
         with open(self.output_dir / 'dataset_summary.json', 'w') as f:
             json.dump(summary, f, indent=2)

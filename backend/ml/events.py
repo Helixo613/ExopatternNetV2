@@ -160,11 +160,29 @@ def _merge_star_windows(
         if not run_global_indices:
             return
         n_win = len(run_global_indices)
+
+        # Split oversized runs into max_event_windows-size chunks rather than
+        # discarding them — prevents whole-star blackout when threshold is low.
         if n_win > max_event_windows:
-            logger.debug(
-                f"Star {star_id}: discarding run of {n_win} windows "
-                f"(exceeds max_event_windows={max_event_windows})"
-            )
+            for chunk_start in range(0, n_win, max_event_windows):
+                chunk_end = min(chunk_start + max_event_windows, n_win)
+                gi = run_global_indices[chunk_start:chunk_end]
+                wi = run_window_indices[chunk_start:chunk_end]
+                st = run_start_times[chunk_start:chunk_end]
+                et = run_end_times[chunk_start:chunk_end]
+                win_composites = composite_scores[gi]
+                ev_score = _aggregate_score(win_composites, event_score_method)
+                model_scores: Dict[str, float] = {}
+                if per_model_scores:
+                    for model_name, arr in per_model_scores.items():
+                        model_scores[model_name] = float(np.max(arr[gi]))
+                candidates.append(CandidateEvent(
+                    star_id=star_id,
+                    start_time=min(st), end_time=max(et),
+                    center_time=(min(st) + max(et)) / 2.0,
+                    window_indices=list(wi), n_windows=len(gi),
+                    model_scores=model_scores, composite_score=ev_score,
+                ))
             run_global_indices = []
             run_window_indices = []
             run_start_times = []
@@ -257,8 +275,14 @@ def _aggregate_score(
 
 
 def sort_candidates(candidates: List[CandidateEvent]) -> List[CandidateEvent]:
-    """Return candidates sorted by composite_score descending (best first)."""
-    return sorted(candidates, key=lambda c: c.composite_score, reverse=True)
+    """Return candidates sorted by ranking_score descending (fallback: composite)."""
+    return sorted(
+        candidates,
+        key=lambda c: (
+            c.ranking_score if c.ranking_score is not None else c.composite_score
+        ),
+        reverse=True,
+    )
 
 
 def candidates_to_records(candidates: List[CandidateEvent]) -> List[Dict]:

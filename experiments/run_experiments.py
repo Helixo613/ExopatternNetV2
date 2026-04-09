@@ -1,14 +1,27 @@
 """
-Experiment runner for producing all paper figures and tables.
+LEGACY experiment runner (point-level, window-based metrics).
+
+>>> THIS IS NOT THE PAPER PATH. <<<
+
+The paper results (event-level metrics, conformal calibration, injection-recovery)
+live in experiments/run_paper_experiments.py and backend/ml/pipeline.py.
+
+This file is kept for exploratory / ablation use only.  Several patterns here
+are INTENTIONALLY not paper-valid:
+  - Experiments 3, 5, 6 fit and evaluate on the SAME data (train-on-test).
+    Reported metrics are optimistic and NOT comparable to the CV results in
+    run_paper_experiments.py.
+  - CV here is window-level stratified split, not star-level GroupKFold.
+    Same-star leakage is possible.
 
 7 experiments:
-1. Model Comparison Table — all models x 5-fold CV
-2. Feature Ablation — cumulative feature groups
-3. Per-Type Detection — transit/flare/outlier/normal detection rates
-4. Hyperparameter Sensitivity — contamination, window_size sweeps
-5. Detection Examples — qualitative figure with example light curves
-6. Feature Importance — from best tree-based model
-7. Statistical Significance — paired tests between top models
+1. Model Comparison Table -- all models x 5-fold CV
+2. Feature Ablation -- cumulative feature groups
+3. Per-Type Detection -- transit/flare/outlier/normal detection rates
+4. Hyperparameter Sensitivity -- contamination, window_size sweeps
+5. Detection Examples -- qualitative figure with example light curves
+6. Feature Importance -- from best tree-based model
+7. Statistical Significance -- paired tests between top models
 """
 
 import numpy as np
@@ -196,7 +209,10 @@ class ExperimentRunner:
         # For now, use label_type from metadata
         anomaly_types = np.where(y == 1, 'anomaly', 'normal')
 
-        # Train on full data (or best fold)
+        # TRAIN-ON-TEST: this experiment fits on X and evaluates on the same X.
+        # This is intentional for qualitative per-type breakdown but produces
+        # optimistic metrics. Do NOT report these numbers in the paper -- use
+        # run_paper_experiments.py (star-level CV) for publication results.
         model = get_model(model_name, contamination=DEFAULT_CONTAMINATION,
                           random_state=RANDOM_SEED)
         model.fit(X)

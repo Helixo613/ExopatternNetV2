@@ -73,6 +73,16 @@ class PipelineConfig:
     n_estimators: int = 100           # IF n_estimators
     random_state: int = 42
 
+    # Disk-backed feature store (shared across folds and ablations)
+    # Set to a directory path to enable; None disables the store.
+    feature_store_dir: Optional[str] = None
+
+    # Maximum training windows passed to model fitting and normaliser.
+    # If the fold's feature matrix exceeds this, a random subsample is taken.
+    # None = no limit (use all windows).  Bounds peak RAM for large datasets.
+    # Recommended: 200_000 for 32 GB RAM; None for local dev datasets.
+    max_train_windows: Optional[int] = None
+
 
 # ---------------------------------------------------------------------------
 # Core pipeline
@@ -110,7 +120,17 @@ class RankingPipeline:
         self._scorer: Optional[MultiViewScorer] = None
         self._conformal: Optional[ConformalCalibrator] = None
         self._consistency_normalizer: Optional[ConsistencyScoreNormalizer] = None
+        self._impute_medians: Optional[np.ndarray] = None  # from training
         self._fitted = False
+        # Per-star feature cache: {star_id -> (features, metadata)}
+        # Avoids redundant extraction across fit/score_stars/calibration calls
+        self._feature_cache: Dict[str, Tuple[np.ndarray, List]] = {}
+        # Disk-backed feature store (optional)
+        self._feature_store = None
+        self._config_hash: Optional[str] = None
+        if self.config.feature_store_dir:
+            from backend.ml.feature_store import StarFeatureStore
+            self._feature_store = StarFeatureStore(self.config.feature_store_dir)
 
     # ------------------------------------------------------------------
     # Fit
@@ -136,20 +156,52 @@ class RankingPipeline:
 
         cfg = self.config
 
-        # 1. Extract features for all training stars
+        # 1. Extract features for all training stars, tracking total count to enable
+        #    proportional per-star subsampling BEFORE vstack (avoids peak-RAM spike).
         logger.info(f"Extracting features for {len(train_dfs)} training stars...")
         all_features: List[np.ndarray] = []
+        total_windows = 0
 
         for star_id, df in train_dfs.items():
             feats = self._extract_star_features(df, star_id, tls_cache)
             if feats is not None and len(feats) > 0:
                 all_features.append(feats)
+                total_windows += len(feats)
 
         if not all_features:
             raise ValueError("No features extracted from training stars.")
 
-        X_train = np.vstack(all_features)
-        logger.info(f"Training feature matrix: {X_train.shape}")
+        logger.info(f"Collected {total_windows} windows from {len(all_features)} stars")
+
+        mtw = cfg.max_train_windows
+        if mtw is not None and total_windows > mtw:
+            # Proportional pre-subsampling: each star contributes ~(n_star/total)*mtw rows.
+            # Subsetting here avoids materialising the full (total_windows × n_features)
+            # matrix. Deleting all_features before vstack lets GC release the list
+            # references, keeping peak allocation close to 1× the subset size.
+            rng = np.random.default_rng(cfg.random_state)
+            sub_arrays: List[np.ndarray] = []
+            for f in all_features:
+                n_take = max(1, round(len(f) * mtw / total_windows))
+                idx = rng.choice(len(f), size=min(n_take, len(f)), replace=False)
+                sub_arrays.append(f[idx])
+            del all_features          # release list before allocating subset matrix
+            X_train = np.vstack(sub_arrays)
+            del sub_arrays
+            logger.info(
+                f"fit(): pre-subsampled {total_windows} → {len(X_train)} windows "
+                f"(max_train_windows={mtw}, proportional per star)"
+            )
+        else:
+            X_train = np.vstack(all_features)
+            del all_features          # release list once matrix is owned by X_train
+
+        logger.info(f"Training matrix for models: {X_train.shape}")
+
+
+        # Store training column medians for consistent NaN imputation at inference
+        col_medians = np.nanmedian(X_train, axis=0)
+        self._impute_medians = np.where(np.isnan(col_medians), 0.0, col_medians)
 
         # 2. Build and fit models (each model has different accepted kwargs)
         _MODEL_KWARGS: Dict[str, Dict] = {
@@ -203,6 +255,8 @@ class RankingPipeline:
         df: pd.DataFrame,
         tls_cache: Optional[Dict[str, Dict]] = None,
         gt_events: Optional[List] = None,
+        threshold_override: Optional[float] = None,
+        use_cache: bool = True,
     ) -> List[CandidateEvent]:
         """
         Score a single star and return candidate events.
@@ -213,6 +267,8 @@ class RankingPipeline:
             tls_cache: optional precomputed TLS features
             gt_events: optional ground truth events (used only for
                        conformal null collection in calibration mode)
+            threshold_override: if given, use this threshold instead of the
+                       fitted one (useful for calibration-mode FP collection)
 
         Returns:
             list of CandidateEvent, sorted by ranking_score descending
@@ -222,21 +278,57 @@ class RankingPipeline:
 
         cfg = self.config
 
-        # 1. Extract features + metadata
-        feats, _, meta = self._preprocessor.extract_features_with_metadata(
-            df, star_id=star_id,
-            window_size=cfg.window_size,
-        )
+        # 1. Check feature cache before expensive extraction
+        tls_feats: Dict = {}
+        if use_cache and star_id in self._feature_cache:
+            feats_raw, meta = self._feature_cache[star_id]
+            feats = _impute_nan(feats_raw.copy(), self._impute_medians)
+            # Still need TLS dict for consistency features later
+            if cfg.use_tls:
+                tls_feats = _get_or_compute_tls(star_id, df, tls_cache)
+        else:
+            # Full extraction path: check disk store before re-extracting
+            _store_hit = False
+            if use_cache and self._feature_store is not None:
+                _stored = self._feature_store.load(star_id, self._get_config_hash())
+                if _stored is not None:
+                    feats_f32, meta = _stored
+                    self._feature_cache[star_id] = (feats_f32, meta)
+                    feats = _impute_nan(feats_f32.copy(), self._impute_medians)
+                    if cfg.use_tls:
+                        tls_feats = _get_or_compute_tls(star_id, df, tls_cache)
+                    _store_hit = True
+
+            if not _store_hit:
+                df_proc = self._preprocessor.preprocess(df, normalize=True, sigma=cfg.sigma_clip)
+                feats, _, meta = self._preprocessor.extract_features_with_metadata(
+                    df_proc, star_id=star_id,
+                    window_size=cfg.window_size,
+                    stride=cfg.stride,
+                )
+
+                if len(feats) == 0:
+                    logger.warning(f"{star_id}: no windows extracted")
+                    return []
+
+                if cfg.use_tls:
+                    tls_feats = _get_or_compute_tls(star_id, df, tls_cache)
+                    feats = append_tls_to_windows(feats, tls_feats)
+
+                # Bypassed for injection trials (use_cache=False) to prevent
+                # cache-key collisions across concurrent ThreadPoolExecutor workers.
+                if use_cache:
+                    feats_f32 = feats.astype(np.float32)
+                    self._feature_cache[star_id] = (feats_f32, meta)
+                    if self._feature_store is not None:
+                        self._feature_store.save(star_id, self._get_config_hash(), feats_f32, meta)
+                    feats = _impute_nan(feats_f32.copy(), self._impute_medians)
+                else:
+                    feats = _impute_nan(feats.astype(np.float32), self._impute_medians)
 
         if len(feats) == 0:
             logger.warning(f"{star_id}: no windows extracted")
             return []
-
-        # 2. Append TLS global features (if enabled)
-        tls_feats: Dict = {}
-        if cfg.use_tls:
-            tls_feats = _get_or_compute_tls(star_id, df, tls_cache)
-            feats = append_tls_to_windows(feats, tls_feats)
 
         # 3. Score windows
         raw_scores = MultiViewScorer.score_windows(
@@ -245,10 +337,14 @@ class RankingPipeline:
         composite = self._scorer.composite(raw_scores)
 
         # 4. Generate candidates
+        eff_threshold = (
+            threshold_override if threshold_override is not None
+            else self._scorer.threshold
+        )
         candidates = generate_candidates(
             composite_scores=composite,
             metadata=meta,
-            threshold=self._scorer.threshold,
+            threshold=eff_threshold,
             per_model_scores=raw_scores,
             gap_tolerance=cfg.gap_tolerance,
             max_event_windows=cfg.max_event_windows,
@@ -260,17 +356,23 @@ class RankingPipeline:
 
         # 5. Attach TLS event-consistency features
         if cfg.use_tls and tls_feats:
-            attach_consistency_features(candidates, {star_id: tls_feats})
+            # Use raw (median-normalized) df so depth units match TLS depth (fractional)
+            flux_dips = _estimate_candidate_flux_dips(candidates, df)
+            attach_consistency_features(
+                candidates,
+                {star_id: tls_feats},
+                flux_dip_by_candidate=flux_dips,
+            )
 
             # Normalize consistency and compute ranking_score
             if self._consistency_normalizer is not None:
                 for cand in candidates:
                     c_score = self._consistency_normalizer.score(cand)
-                    # Invert: high consistency = less novel = lower anomaly interest
-                    novelty_bonus = 1.0 - c_score
+                    # Blueprint ranking: alpha * composite + (1 - alpha) * consistency
+                    # High consistency = strong transit alignment = higher rank
                     cand.ranking_score = float(
                         cfg.alpha * cand.composite_score
-                        + (1.0 - cfg.alpha) * novelty_bonus
+                        + (1.0 - cfg.alpha) * c_score
                     )
             else:
                 # No normalizer yet — use composite score only
@@ -292,13 +394,15 @@ class RankingPipeline:
         self,
         star_dfs: Dict[str, pd.DataFrame],
         tls_cache: Optional[Dict[str, Dict]] = None,
+        threshold_override: Optional[float] = None,
     ) -> List[CandidateEvent]:
         """
         Score multiple stars and return all candidates (sorted by ranking_score).
         """
         all_candidates: List[CandidateEvent] = []
         for star_id, df in star_dfs.items():
-            cands = self.score_star(star_id, df, tls_cache)
+            cands = self.score_star(star_id, df, tls_cache,
+                                    threshold_override=threshold_override)
             all_candidates.extend(cands)
         all_candidates.sort(key=lambda c: c.ranking_score, reverse=True)
         return all_candidates
@@ -361,10 +465,16 @@ class RankingPipeline:
         calibrator).
         """
         def _pipeline_fn(df: pd.DataFrame) -> List[CandidateEvent]:
+            # use_cache=False: injection trials run concurrently in a ThreadPoolExecutor.
+            # All trials share star_id='__injection__', which would cause different
+            # injected light curves to collide on the same cache key, corrupting
+            # completeness estimates. Disabling the cache makes scoring stateless
+            # and thread-safe at the cost of re-extraction per trial.
             return self.score_star(
                 star_id='__injection__',
                 df=df,
                 tls_cache=tls_cache,
+                use_cache=False,
             )
         return _pipeline_fn
 
@@ -372,17 +482,48 @@ class RankingPipeline:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _get_config_hash(self) -> str:
+        """Return an 8-char hash encoding the feature extraction config."""
+        if self._config_hash is None:
+            from backend.ml.feature_store import StarFeatureStore
+            cfg = self.config
+            self._config_hash = StarFeatureStore.make_config_hash(
+                cfg.window_size, cfg.stride, cfg.sigma_clip, cfg.use_tls
+            )
+        return self._config_hash
+
     def _extract_star_features(
         self,
         df: pd.DataFrame,
         star_id: str,
         tls_cache: Optional[Dict[str, Dict]],
     ) -> Optional[np.ndarray]:
-        """Extract window features (+ TLS if enabled) for one star."""
+        """Extract window features (+ TLS if enabled) for one star.
+
+        Check order: in-memory cache → disk feature store → full extraction.
+        Populates both caches after extraction.
+        """
+        # 1. In-memory cache hit
+        if star_id in self._feature_cache:
+            feats_raw, _ = self._feature_cache[star_id]
+            return _impute_nan(feats_raw.copy())
+
+        # 2. Disk feature store hit
+        if self._feature_store is not None:
+            stored = self._feature_store.load(star_id, self._get_config_hash())
+            if stored is not None:
+                feats_f32, meta = stored
+                self._feature_cache[star_id] = (feats_f32, meta)
+                logger.debug(f"{star_id}: features loaded from disk store")
+                return _impute_nan(feats_f32.copy())
+
+        # 3. Full extraction
         cfg = self.config
         try:
-            feats, _, _ = self._preprocessor.extract_features_with_metadata(
-                df, star_id=star_id, window_size=cfg.window_size
+            df_proc = self._preprocessor.preprocess(df, normalize=True, sigma=cfg.sigma_clip)
+            feats, _, meta = self._preprocessor.extract_features_with_metadata(
+                df_proc, star_id=star_id, window_size=cfg.window_size,
+                stride=cfg.stride,
             )
             if len(feats) == 0:
                 logger.warning(f"{star_id}: no features extracted")
@@ -392,10 +533,49 @@ class RankingPipeline:
                 tls_feats = _get_or_compute_tls(star_id, df, tls_cache)
                 feats = append_tls_to_windows(feats, tls_feats)
 
-            return feats
+            feats_f32 = feats.astype(np.float32)
+            self._feature_cache[star_id] = (feats_f32, meta)
+            # Persist to disk store for cross-fold / cross-experiment reuse
+            if self._feature_store is not None:
+                self._feature_store.save(star_id, self._get_config_hash(), feats_f32, meta)
+            return _impute_nan(feats_f32.copy())
         except Exception as e:
             logger.warning(f"{star_id}: feature extraction failed: {e}")
             return None
+
+    def preload_to_store(
+        self,
+        star_dfs: Dict[str, pd.DataFrame],
+        tls_cache: Optional[Dict[str, Dict]] = None,
+    ) -> int:
+        """
+        Precompute and persist features for a set of stars.
+
+        Useful before injection-recovery: call this with the injection corpus
+        so the disk store is warm before threaded trials start.  Trials with
+        use_cache=False still re-extract for each injected LC (unavoidable —
+        the flux has changed), but training-star features are ready for the
+        fold-fit path that runs before injection.
+
+        Returns the number of stars written to the store.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before preload_to_store().")
+        saved = 0
+        for star_id, df in star_dfs.items():
+            if star_id not in self._feature_cache:
+                if self._feature_store is not None and \
+                        self._feature_store.has(star_id, self._get_config_hash()):
+                    continue  # already on disk
+            result = self._extract_star_features(df, star_id, tls_cache)
+            if result is not None:
+                saved += 1
+        logger.info(f"preload_to_store: {saved} stars written/verified in feature store")
+        return saved
+
+    def clear_cache(self) -> None:
+        """Free the per-star feature cache (call between experiments)."""
+        self._feature_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -412,3 +592,49 @@ def _get_or_compute_tls(
         return tls_cache[star_id]
     return extract_tls_features(df['time'].values, df['flux'].values)
 
+
+def _impute_nan(X: np.ndarray, fill_values: Optional[np.ndarray] = None) -> np.ndarray:
+    """Replace NaN values with fill_values (training medians) or column medians."""
+    if not np.any(np.isnan(X)):
+        return X
+    X = X.copy()
+    if fill_values is not None:
+        medians = fill_values
+    else:
+        medians = np.nanmedian(X, axis=0)
+        medians = np.where(np.isnan(medians), 0.0, medians)
+    nan_mask = np.isnan(X)
+    X[nan_mask] = np.take(medians, np.where(nan_mask)[1])
+    return X
+
+
+def _estimate_candidate_flux_dips(
+    candidates: List[CandidateEvent],
+    df: pd.DataFrame,
+) -> Dict[int, float]:
+    """
+    Estimate observed fractional dip depth for each candidate.
+
+    Depth = (local_median - local_min) / local_median, which matches the
+    fractional units returned by TLS (depth ≈ 1 - min_normalized_flux).
+    Must be called with raw (not z-scored) flux so units are compatible.
+    """
+    flux_dips: Dict[int, float] = {}
+    time = df['time'].values
+    flux = df['flux'].values
+
+    for cand in candidates:
+        mask = (time >= cand.start_time) & (time <= cand.end_time)
+        if not np.any(mask):
+            continue
+        segment = flux[mask]
+        if len(segment) == 0:
+            continue
+        local_median = float(np.median(segment))
+        local_min = float(np.min(segment))
+        if abs(local_median) > 1e-9:
+            flux_dips[id(cand)] = max(0.0, (local_median - local_min) / abs(local_median))
+        else:
+            flux_dips[id(cand)] = 0.0
+
+    return flux_dips

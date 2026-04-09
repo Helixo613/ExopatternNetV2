@@ -1,7 +1,7 @@
 """
 Conformal calibration for anomaly candidate ranking.
 
-Converts raw composite anomaly scores into calibrated p-values with a
+Converts raw candidate ranking scores into calibrated p-values with a
 finite-sample false alarm rate guarantee (Vovk et al., 2005).
 
 Guarantee: for any alpha in [0, 1],
@@ -43,7 +43,7 @@ class ConformalCalibrator:
         Store the calibration null distribution.
 
         Args:
-            null_scores: composite scores of false-positive candidates from
+            null_scores: ranking scores of false-positive candidates from
                          calibration stars (higher = more anomalous).
                          Must be from stars DISJOINT from both train and test.
         """
@@ -69,7 +69,7 @@ class ConformalCalibrator:
         the null distribution — strong evidence of anomalousness.
 
         Args:
-            test_scores: composite scores of test candidates
+            test_scores: ranking scores of test candidates
 
         Returns:
             p-value array, same shape as test_scores, in [0, 1]
@@ -84,17 +84,16 @@ class ConformalCalibrator:
             # No null data — all p-values are 1.0 (no information)
             return np.ones_like(test_scores)
 
-        p_values = np.empty_like(test_scores)
-        for i, s in enumerate(test_scores):
-            # Number of null scores >= s_test
-            n_above = int(np.searchsorted(-self._null_scores, -s, side='right'))
-            p_values[i] = (n_above + 1) / (n + 1)
+        # Vectorized: _null_scores is sorted descending, so -_null_scores is ascending.
+        # searchsorted on the negated arrays counts how many null scores >= each test score.
+        n_above = np.searchsorted(-self._null_scores, -test_scores, side='right')
+        p_values = (n_above + 1) / (n + 1)
 
         return np.clip(p_values, 0.0, 1.0)
 
     def threshold_at_alpha(self, alpha: float) -> float:
         """
-        Return the composite score threshold that corresponds to significance
+        Return the ranking-score threshold that corresponds to significance
         level alpha.  Candidates with score >= threshold have p_value <= alpha.
 
         Args:
@@ -179,7 +178,10 @@ def apply_conformal_to_candidates(
     """
     if not candidates:
         return
-    scores = np.array([c.composite_score for c in candidates])
+    scores = np.array([
+        c.ranking_score if c.ranking_score is not None else c.composite_score
+        for c in candidates
+    ])
     p_values = calibrator.predict(scores)
     for cand, pv in zip(candidates, p_values):
         cand.p_value = float(pv)
@@ -193,7 +195,7 @@ def calibration_diagnostics(
     Report diagnostics for a calibration null distribution.
 
     Args:
-        null_scores: FP candidate scores used as the null
+        null_scores: FP candidate ranking scores used as the null
         alpha_levels: significance levels to report thresholds for
 
     Returns:

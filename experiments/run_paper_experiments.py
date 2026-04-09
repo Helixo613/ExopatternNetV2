@@ -43,7 +43,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from experiments.paper_config import *
 from backend.ml.pipeline import RankingPipeline, PipelineConfig
 from backend.ml.event_evaluation import (
-    load_ground_truth_events, event_metrics, aggregate_event_metrics,
+    load_ground_truth_events, compute_ground_truth_events_from_dfs,
+    event_metrics, aggregate_event_metrics,
 )
 from backend.ml.conformal import (
     ConformalCalibrator, calibration_diagnostics,
@@ -60,6 +61,68 @@ logging.basicConfig(
 )
 logger = logging.getLogger('paper_experiments')
 warnings.filterwarnings('ignore')
+TLS_DISK_CACHE = Path("results/paper/tls_cache.json")
+FEATURE_STORE_DIR = Path("results/paper/feature_store")
+
+
+class LazyCorpus(dict):
+    """
+    Lazy-loading dict of star DataFrames.
+
+    Each star's CSV is read from disk only when first accessed.  When the
+    pipeline's disk feature store is warm (all stars already extracted),
+    score_star() loads features directly from the store and never triggers
+    a CSV read via __getitem__.
+
+    This collapses the upfront 1.1 GB corpus load to zero on repeated runs
+    where features are cached, and to star-by-star streaming on first run.
+    """
+
+    def __init__(self, metadata_df: pd.DataFrame, lc_dir: Path) -> None:
+        super().__init__()
+        self._meta = {str(row['target_id']): row for _, row in metadata_df.iterrows()}
+        self._lc_dir = lc_dir
+        for sid in self._meta:
+            super().__setitem__(sid, None)
+
+    def __getitem__(self, star_id: str):
+        val = super().__getitem__(star_id)
+        if val is None:
+            row = self._meta[star_id]
+            path = self._lc_dir / row['filename']
+            try:
+                df = pd.read_csv(path)
+            except Exception as e:
+                raise KeyError(f"Could not load {star_id}: {e}") from e
+            super().__setitem__(star_id, df)
+            return df
+        return val
+
+    def get(self, star_id: str, default=None):
+        """
+        dict.get() variant that preserves lazy-loading semantics.
+
+        compute_ground_truth_events_from_dfs() uses dfs.get(star_id), so if we
+        inherit dict.get() unchanged it returns the stored sentinel None instead
+        of triggering a CSV load. That silently collapses all GT event lists to
+        empty under LazyCorpus.
+        """
+        if star_id not in self._meta:
+            return default
+        try:
+            return self[star_id]
+        except KeyError:
+            return default
+
+    def items(self):
+        for k in self._meta:
+            try:
+                yield k, self[k]
+            except KeyError as e:
+                logger.warning(str(e))
+
+    def keys(self):
+        return self._meta.keys()
 
 
 # ---------------------------------------------------------------------------
@@ -70,25 +133,22 @@ def load_dataset(metadata_csv: str, lightcurve_dir: str) -> Dict:
     """
     Load all light curves and metadata.
 
+    Uses lazy loading: each star's CSV is read on first access rather than
+    all at once.  When combined with a populated disk feature store, repeated
+    runs avoid reading any CSVs for the feature-extraction path entirely.
+
     Returns:
-        dict with keys: star_ids, dfs, metadata, gt_events_by_star
+        dict with keys: star_ids, dfs (LazyCorpus), metadata, gt_events_by_star
     """
     meta = pd.read_csv(metadata_csv)
     lc_dir = Path(lightcurve_dir)
+    dfs = LazyCorpus(meta, lc_dir)
+    logger.info(f"LazyCorpus registered {len(dfs)} stars (CSVs loaded on first access)")
 
-    dfs: Dict[str, pd.DataFrame] = {}
-    for _, row in meta.iterrows():
-        sid = str(row['target_id'])
-        path = lc_dir / row['filename']
-        try:
-            dfs[sid] = pd.read_csv(path)
-        except Exception as e:
-            logger.warning(f"Could not load {sid}: {e}")
-
-    logger.info(f"Loaded {len(dfs)} light curves")
-
-    gt_events = load_ground_truth_events(metadata_csv, lightcurve_dir)
-    logger.info(f"Ground truth events loaded for {len(gt_events)} stars")
+    # GT event computation needs time ranges — triggers CSV loads on first run,
+    # but metadata is cheap to recompute and is not the bottleneck.
+    gt_events = compute_ground_truth_events_from_dfs(meta, dfs)
+    logger.info(f"Ground truth events computed for {len(gt_events)} stars")
 
     return {
         'star_ids': list(dfs.keys()),
@@ -98,15 +158,97 @@ def load_dataset(metadata_csv: str, lightcurve_dir: str) -> Dict:
     }
 
 
-def precompute_tls_cache(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Dict]:
-    """Precompute TLS features for all stars (slow; ~2-5 min for 150 stars)."""
-    logger.info(f"Precomputing TLS for {len(dfs)} stars...")
+
+
+def precompute_tls_cache(dfs: Dict[str, pd.DataFrame], n_workers: int = 2) -> Dict[str, Dict]:
+    """Precompute TLS features for all stars in parallel.
+
+    Results are cached to disk (results/paper/tls_cache.json) so reruns are instant.
+    Uses ThreadPoolExecutor (not ProcessPoolExecutor) because transitleastsquares
+    uses its own internal multiprocessing — nesting it in ProcessPoolExecutor
+    causes deadlocks on Linux via fork-inside-fork.
+    """
+    import json as _json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from backend.ml.tls_features import _TLS_FALLBACK
+
+    # --- Load from disk cache if available ---
     cache: Dict[str, Dict] = {}
-    for i, (sid, df) in enumerate(dfs.items()):
-        cache[sid] = extract_tls_features(df['time'].values, df['flux'].values)
-        logger.info(
-            f"  [{i+1}/{len(dfs)}] {sid}: SDE={cache[sid]['tls_sde']:.2f}"
-        )
+    if TLS_DISK_CACHE.exists():
+        try:
+            cached = _json.loads(TLS_DISK_CACHE.read_text())
+            # Only use cache entries for stars in this dataset
+            # Restore NaN values lost during JSON serialization (NaN → null → None)
+            cache = {
+                sid: {k: (float('nan') if v is None else v) for k, v in cached[sid].items()}
+                for sid in dfs if sid in cached
+            }
+            if len(cache) == len(dfs):
+                logger.info(f"TLS cache loaded from disk ({len(cache)} stars) — skipping recompute")
+                return cache
+            else:
+                logger.info(f"TLS cache partial ({len(cache)}/{len(dfs)}) — computing missing stars")
+        except Exception as e:
+            logger.warning(f"Could not load TLS disk cache: {e} — recomputing all")
+            cache = {}
+
+    missing = {sid: df for sid, df in dfs.items() if sid not in cache}
+    logger.info(f"Precomputing TLS for {len(missing)} stars ({n_workers} workers)...")
+
+    def _compute_one(sid_df):
+        sid, df = sid_df
+        try:
+            return sid, extract_tls_features(df['time'].values, df['flux'].values)
+        except Exception as e:
+            logger.warning(f"  TLS failed for {sid}: {e} — using fallback")
+            return sid, dict(_TLS_FALLBACK)
+
+    completed = 0
+    total = len(missing)
+
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=total, desc="TLS precompute", unit="star", dynamic_ncols=True)
+    except ImportError:
+        pbar = None
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_compute_one, (sid, df)): sid
+                   for sid, df in missing.items()}
+        for future in as_completed(futures):
+            try:
+                sid, result = future.result(timeout=600)
+                cache[sid] = result
+                completed += 1
+                if pbar:
+                    pbar.set_postfix(star=sid[:20], SDE=f"{result['tls_sde']:.2f}")
+                    pbar.update(1)
+                else:
+                    logger.info(f"  [{completed}/{total}] {sid}: SDE={result['tls_sde']:.2f}")
+            except Exception as e:
+                sid = futures[future]
+                logger.warning(f"  TLS future failed for {sid}: {e} — using fallback")
+                completed += 1
+                if pbar:
+                    pbar.update(1)
+                cache[sid] = dict(_TLS_FALLBACK)
+
+    if pbar:
+        pbar.close()
+
+    # --- Save to disk cache ---
+    try:
+        TLS_DISK_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        # Convert any non-serializable values (nan → null)
+        serializable = {}
+        for sid, feats in cache.items():
+            serializable[sid] = {k: (None if (v is not None and v != v) else v)
+                                  for k, v in feats.items()}
+        TLS_DISK_CACHE.write_text(_json.dumps(serializable, indent=2))
+        logger.info(f"TLS cache saved to {TLS_DISK_CACHE}")
+    except Exception as e:
+        logger.warning(f"Could not save TLS disk cache: {e}")
+
     return cache
 
 
@@ -184,7 +326,9 @@ def run_star_cv(
         if train_cands:
             pipeline.fit_consistency_normalizer(train_cands)
 
-        # Calibration: collect FP candidates → conformal null
+        # Calibration: collect FP candidates → conformal null.
+        # Must use the same threshold as test scoring to preserve exchangeability
+        # between calibration and test candidates (required for FAR guarantee).
         calib_cands = pipeline.score_stars(calib_dfs, tls_cache)
         fp_scores = _collect_fp_scores(calib_cands, gt_by_star)
         logger.info(f"  Calibration FP candidates: {len(fp_scores)}")
@@ -229,14 +373,25 @@ def _collect_fp_scores(
     candidates: List,
     gt_by_star: Dict[str, List],
 ) -> np.ndarray:
-    """Return composite scores of candidates that don't match any GT event."""
-    from backend.ml.event_evaluation import _find_matching_gt
+    """
+    Return ranking scores of false-positive candidates using proper per-star
+    one-to-one matching (highest-scoring candidate claims each GT event first).
+    """
+    from collections import defaultdict
+    from backend.ml.event_evaluation import match_events
+
+    cands_by_star: Dict[str, List] = defaultdict(list)
+    for cand in candidates:
+        cands_by_star[cand.star_id].append(cand)
 
     fp_scores = []
-    for cand in candidates:
-        gt_events = gt_by_star.get(cand.star_id, [])
-        if _find_matching_gt(cand, gt_events, overlap_fraction=0.25) is None:
-            fp_scores.append(cand.composite_score)
+    for star_id, star_cands in cands_by_star.items():
+        gt_events = gt_by_star.get(star_id, [])
+        _, fp_cands, _, _ = match_events(star_cands, gt_events)
+        for cand in fp_cands:
+            fp_scores.append(
+                cand.ranking_score if cand.ranking_score is not None else cand.composite_score
+            )
     return np.array(fp_scores)
 
 
@@ -252,6 +407,7 @@ def experiment_1_cv(dataset: Dict, dev_mode: bool = False) -> Dict:
 
     cfg = PipelineConfig(
         window_size=WINDOW_SIZE,
+        stride=STRIDE,
         flag_quantile=FLAG_QUANTILE,
         gap_tolerance=GAP_TOLERANCE,
         max_event_windows=MAX_EVENT_WINDOWS,
@@ -259,6 +415,8 @@ def experiment_1_cv(dataset: Dict, dev_mode: bool = False) -> Dict:
         alpha=TLS_ALPHA,
         contamination=CONTAMINATION,
         use_tls=True,
+        feature_store_dir=str(FEATURE_STORE_DIR),
+        max_train_windows=MAX_TRAIN_WINDOWS,
     )
     n_splits = 2 if dev_mode else N_CV_FOLDS
 
@@ -297,8 +455,10 @@ def experiment_2_conformal(dataset: Dict, dev_mode: bool = False) -> Dict:
     logger.info("="*60)
 
     cfg = PipelineConfig(
-        window_size=WINDOW_SIZE, use_tls=False,  # skip TLS for speed here
+        window_size=WINDOW_SIZE, stride=STRIDE, use_tls=False,
         flag_quantile=FLAG_QUANTILE, contamination=CONTAMINATION,
+        feature_store_dir=str(FEATURE_STORE_DIR),
+        max_train_windows=MAX_TRAIN_WINDOWS,
     )
     n_splits = 2 if dev_mode else N_CV_FOLDS
     tls_cache = None  # TLS off for conformal validation
@@ -342,8 +502,10 @@ def experiment_3_ablation(dataset: Dict, dev_mode: bool = False) -> Dict:
     for alpha in TLS_ALPHA_ABLATION:
         logger.info(f"  alpha={alpha:.1f}")
         cfg = PipelineConfig(
-            window_size=WINDOW_SIZE, use_tls=True, alpha=alpha,
+            window_size=WINDOW_SIZE, stride=STRIDE, use_tls=True, alpha=alpha,
             flag_quantile=FLAG_QUANTILE, contamination=CONTAMINATION,
+            feature_store_dir=str(FEATURE_STORE_DIR),
+            max_train_windows=MAX_TRAIN_WINDOWS,
         )
         res = run_star_cv(dataset, cfg, n_splits=n_splits, tls_cache=tls_cache)
         agg = res['aggregated']
@@ -364,9 +526,11 @@ def experiment_3_ablation(dataset: Dict, dev_mode: bool = False) -> Dict:
     for method in EVENT_SCORE_ABLATION:
         logger.info(f"  method={method}")
         cfg = PipelineConfig(
-            window_size=WINDOW_SIZE, use_tls=True, alpha=TLS_ALPHA,
+            window_size=WINDOW_SIZE, stride=STRIDE, use_tls=True, alpha=TLS_ALPHA,
             event_score_method=method, flag_quantile=FLAG_QUANTILE,
             contamination=CONTAMINATION,
+            feature_store_dir=str(FEATURE_STORE_DIR),
+            max_train_windows=MAX_TRAIN_WINDOWS,
         )
         res = run_star_cv(dataset, cfg, n_splits=n_splits, tls_cache=tls_cache)
         agg = res['aggregated']
@@ -407,8 +571,10 @@ def experiment_4_shap(dataset: Dict) -> Dict:
     tls_cache = precompute_tls_cache(dfs)
 
     cfg = PipelineConfig(
-        window_size=WINDOW_SIZE, use_tls=True, alpha=TLS_ALPHA,
+        window_size=WINDOW_SIZE, stride=STRIDE, use_tls=True, alpha=TLS_ALPHA,
         flag_quantile=FLAG_QUANTILE, contamination=CONTAMINATION,
+        feature_store_dir=str(FEATURE_STORE_DIR),
+        max_train_windows=MAX_TRAIN_WINDOWS,
     )
     pipeline = RankingPipeline(cfg)
     pipeline.fit(dfs, tls_cache=tls_cache)
@@ -420,21 +586,32 @@ def experiment_4_shap(dataset: Dict) -> Dict:
     # Extract feature matrices for top candidates
     # (re-extract to get per-window features for the candidate windows)
     from backend.ml.preprocessing import LightCurvePreprocessor
-    from backend.ml.tls_features import append_tls_to_windows
-    from backend.ml.feature_names import ALL_WINDOW_FEATURES, TLS_GLOBAL_FEATURE_NAMES
+    from backend.ml.tls_features import append_tls_to_windows, TLS_GLOBAL_FEATURE_NAMES
+    from backend.ml.feature_names import ALL_WINDOW_FEATURES
 
-    prep = LightCurvePreprocessor()
     shap_results = []
 
     for cand in top_k:
         df = dfs.get(cand.star_id)
         if df is None:
             continue
-        feats, _, meta = prep.extract_features_with_metadata(df, star_id=cand.star_id)
-        if len(feats) == 0:
-            continue
-        tls_f = tls_cache.get(cand.star_id, {})
-        feats = append_tls_to_windows(feats, tls_f)
+
+        # Reuse pipeline feature cache (populated during score_stars above) to avoid
+        # redundant extraction. Cache stores pre-imputation float32 features with TLS
+        # already appended, matching the 44-dim feature space the IF model was trained on.
+        if cand.star_id in pipeline._feature_cache:
+            feats_raw, _ = pipeline._feature_cache[cand.star_id]
+            feats = feats_raw.copy().astype(float)  # back to float64 for SHAP
+        else:
+            # Fallback: re-extract if cache miss (e.g. cache was cleared)
+            from backend.ml.preprocessing import LightCurvePreprocessor
+            prep = LightCurvePreprocessor()
+            df_proc = prep.preprocess(df, normalize=True)
+            feats, _, _ = prep.extract_features_with_metadata(df_proc, star_id=cand.star_id)
+            if len(feats) == 0:
+                continue
+            tls_f = tls_cache.get(cand.star_id, {})
+            feats = append_tls_to_windows(feats, tls_f)
 
         # SHAP on the IF model (TreeExplainer, correct for isolation forest)
         if_model = pipeline._scorer._models.get('isolation_forest')
@@ -443,9 +620,10 @@ def experiment_4_shap(dataset: Dict) -> Dict:
 
         try:
             explainer = shap.TreeExplainer(if_model.model)
-            # Use only the candidate's windows
+            # Use only the candidate's windows — scale to match training convention
             window_slice = feats[cand.window_indices]
-            shap_vals = explainer.shap_values(window_slice)
+            window_slice_scaled = if_model.scaler.transform(window_slice)
+            shap_vals = explainer.shap_values(window_slice_scaled)
             mean_shap = np.mean(np.abs(shap_vals), axis=0)
 
             feature_names = ALL_WINDOW_FEATURES + TLS_GLOBAL_FEATURE_NAMES
@@ -494,8 +672,10 @@ def experiment_5_injection_recovery(
 
     # Fit pipeline on all available stars
     cfg = PipelineConfig(
-        window_size=WINDOW_SIZE, use_tls=False,  # TLS off for speed in injection
+        window_size=WINDOW_SIZE, stride=STRIDE, use_tls=False,
         flag_quantile=FLAG_QUANTILE, contamination=CONTAMINATION,
+        feature_store_dir=str(FEATURE_STORE_DIR),
+        max_train_windows=MAX_TRAIN_WINDOWS,
     )
     pipeline = RankingPipeline(cfg)
     pipeline.fit(dfs)
@@ -520,6 +700,7 @@ def experiment_5_injection_recovery(
         rng_seed=RANDOM_SEED,
         recovery_window_factor=INJECTION_RECOVERY_WINDOW_FACTOR,
         progress_callback=progress,
+        n_workers=8,
     )
 
     summary = summarize_injection_recovery(result)
@@ -569,6 +750,14 @@ def main() -> None:
         help='Dev mode: use local 5-star dataset, 1 trial/cell, 2 CV folds',
     )
     parser.add_argument(
+        '--smoke', action='store_true',
+        help='Smoke test: 20 stars, 2 CV folds, 2 trials/cell — full pipeline, fast',
+    )
+    parser.add_argument(
+        '--n-stars', type=int, default=None,
+        help='Limit dataset to first N stars (for testing)',
+    )
+    parser.add_argument(
         '--debug', action='store_true',
         help='Set logging level to DEBUG',
     )
@@ -576,6 +765,12 @@ def main() -> None:
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # --smoke implies --dev settings but with 20 stars
+    if args.smoke:
+        args.dev = True
+        if args.n_stars is None:
+            args.n_stars = 20
 
     to_run = {int(x.strip()) for x in args.exp.split(',')}
 
@@ -588,6 +783,15 @@ def main() -> None:
     t0 = time.time()
     dataset = load_dataset(METADATA_CSV, LIGHTCURVE_DIR)
     logger.info(f"Dataset loaded in {time.time()-t0:.1f}s")
+
+    # Subset dataset if requested
+    if args.n_stars is not None:
+        n = args.n_stars
+        star_ids = dataset['star_ids'][:n]
+        dataset['star_ids'] = star_ids
+        dataset['dfs'] = {sid: dataset['dfs'][sid] for sid in star_ids if sid in dataset['dfs']}
+        dataset['gt_events_by_star'] = {sid: dataset['gt_events_by_star'].get(sid, []) for sid in star_ids}
+        logger.info(f"Dataset subset to {len(dataset['dfs'])} stars (--n-stars {n})")
 
     all_results: Dict[str, Dict] = {}
 

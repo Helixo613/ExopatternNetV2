@@ -335,6 +335,10 @@ def create_app(config: Dict[str, Any] = None) -> Flask:
             features = preprocessor.extract_features(df_processed, window_size)
 
             # Train and predict with selected model
+            # NOTE: this route fits and evaluates on the *same* uploaded file.
+            # This is intentional for quick exploratory feedback but produces
+            # optimistic (train-on-test) metrics that are NOT comparable to the
+            # paper's star-level CV results. Do not use these numbers for reporting.
             from backend.ml.model_registry import get_model as get_ml_model
             model = get_ml_model(model_name, contamination=contamination)
             model.fit(features)

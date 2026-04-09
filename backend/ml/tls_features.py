@@ -52,6 +52,7 @@ _TLS_FALLBACK = {
     'tls_duration': 0.0,
     'tls_odd_even': 1.0,   # 1.0 = no odd/even mismatch (neutral)
     'tls_snr':      0.0,
+    'tls_t0':       np.nan,  # internal only; not appended to window features
 }
 
 
@@ -76,7 +77,7 @@ def extract_tls_features(
 
     Returns:
         dict with keys: tls_sde, tls_period, tls_depth, tls_duration,
-                        tls_odd_even, tls_snr
+                        tls_odd_even, tls_snr, and internal tls_t0
     """
     try:
         from transitleastsquares import transitleastsquares
@@ -92,18 +93,38 @@ def extract_tls_features(
             logger.warning("Too few points for TLS — returning fallback features")
             return dict(_TLS_FALLBACK)
 
+        # TLS requires flux normalized to mean ~1.0.
+        # Divide by median to handle any upstream z-score normalization.
+        flux_median = float(np.median(flux))
+        if abs(flux_median) > 1e-9:
+            flux = flux / flux_median
+
         time_span = float(time.max() - time.min())
         if period_min is None:
             period_min = 0.5
         if period_max is None:
-            period_max = max(period_min + 0.1, time_span / 3.0)
+            # Cap at 150 days — longer periods are undetectable with <3 transits
+            # in typical Kepler baselines and greatly inflate the period grid.
+            period_max = min(max(period_min + 0.1, time_span / 3.0), 150.0)
 
-        model = transitleastsquares(time, flux)
+        # Downsample to at most 20k points for TLS to keep runtime tractable.
+        # TLS runtime scales as O(n_points × n_periods); the transit shape is
+        # preserved at Kepler cadence even after binning by 5-10x.
+        MAX_TLS_POINTS = 10_000
+        if len(time) > MAX_TLS_POINTS:
+            factor = len(time) // MAX_TLS_POINTS
+            n_keep = (len(time) // factor) * factor
+            time_ds = time[:n_keep].reshape(-1, factor).mean(axis=1)
+            flux_ds = flux[:n_keep].reshape(-1, factor).mean(axis=1)
+        else:
+            time_ds, flux_ds = time, flux
+
+        model = transitleastsquares(time_ds, flux_ds)
         results = model.power(
             period_min=period_min,
             period_max=period_max,
-            oversampling_factor=3,
-            duration_grid_step=1.05,
+            oversampling_factor=1,
+            duration_grid_step=1.1,
             show_progress_bar=False,
         )
 
@@ -116,6 +137,19 @@ def extract_tls_features(
         else:
             odd_even = 1.0
 
+        t0 = getattr(results, 'T0', None)
+        if t0 is None:
+            t0 = getattr(results, 'transit_time', None)
+        if t0 is None:
+            t0 = getattr(results, 'transit_times', None)
+        if t0 is None:
+            t0_value = np.nan
+        elif np.isscalar(t0):
+            t0_value = float(t0)
+        else:
+            t0_arr = np.asarray(t0).ravel()
+            t0_value = float(t0_arr[0]) if t0_arr.size else np.nan
+
         return {
             'tls_sde':      float(results.SDE),
             'tls_period':   float(results.period),
@@ -123,6 +157,7 @@ def extract_tls_features(
             'tls_duration': float(results.duration),
             'tls_odd_even': float(odd_even),
             'tls_snr':      float(results.snr),
+            'tls_t0':       t0_value,
         }
 
     except Exception as e:
@@ -214,10 +249,19 @@ def compute_event_consistency(
     Returns:
         dict with tls_epoch_distance, tls_phase_agreement, tls_depth_ratio
     """
-    period   = tls_features.get('tls_period', 0.0)
-    depth    = tls_features.get('tls_depth',  0.0)
+    def _coerce_float(value, default=np.nan) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
 
-    if period <= 0:
+    period = _coerce_float(tls_features.get('tls_period', 0.0), default=np.nan)
+    depth = _coerce_float(tls_features.get('tls_depth', 0.0), default=np.nan)
+    t0 = _coerce_float(tls_features.get('tls_t0', np.nan), default=np.nan)
+
+    if not np.isfinite(period) or period <= 0:
         return {
             'tls_epoch_distance': np.nan,
             'tls_phase_agreement': np.nan,
@@ -226,19 +270,17 @@ def compute_event_consistency(
 
     center = candidate.center_time
 
-    # tls_epoch_distance: distance from candidate center to nearest
-    # predicted transit epoch (in days).  Small = candidate coincides
-    # with a known periodic signal.
-    phase = (center % period) / period          # fractional phase [0, 1)
-    # Distance to nearest transit (phase 0.0), wrapping around
-    phase_dist = min(phase, 1.0 - phase)        # in [0, 0.5]
-    epoch_distance = phase_dist * period        # back to days
-
-    # tls_phase_agreement: 1 - (epoch_distance / (period/2))
-    # = 1 when candidate is exactly on a transit epoch
-    # = 0 when candidate is halfway between transits
-    phase_agreement = 1.0 - (epoch_distance / (period / 2.0))
-    phase_agreement = float(np.clip(phase_agreement, 0.0, 1.0))
+    # tls_epoch_distance: distance from candidate center to the nearest
+    # TLS-predicted transit epoch anchored by tls_t0.
+    if np.isfinite(t0):
+        nearest_n = int(np.round((center - t0) / period))
+        nearest_epoch = t0 + nearest_n * period
+        epoch_distance = abs(center - nearest_epoch)
+        phase_agreement = 1.0 - (epoch_distance / (period / 2.0))
+        phase_agreement = float(np.clip(phase_agreement, 0.0, 1.0))
+    else:
+        epoch_distance = np.nan
+        phase_agreement = np.nan
 
     # tls_depth_ratio: observed_depth / tls_depth.
     # Values near 1.0 = consistent with TLS model.
@@ -298,13 +340,19 @@ class ConsistencyScoreNormalizer:
 
     def _feature_vector(self, candidate) -> np.ndarray:
         """Extract the 3 consistency features as a vector, replacing NaN with 0."""
-        v = np.array([
-            candidate.tls_epoch_distance  if candidate.tls_epoch_distance  is not None else 0.0,
-            candidate.tls_phase_agreement if candidate.tls_phase_agreement is not None else 0.5,
-            candidate.tls_depth_ratio     if candidate.tls_depth_ratio     is not None else 1.0,
-        ], dtype=float)
-        v = np.nan_to_num(v, nan=0.0)
-        return v
+        epoch_distance = candidate.tls_epoch_distance
+        if epoch_distance is None or not np.isfinite(epoch_distance):
+            epoch_distance = 0.0
+
+        phase_agreement = candidate.tls_phase_agreement
+        if phase_agreement is None or not np.isfinite(phase_agreement):
+            phase_agreement = 0.5
+
+        depth_ratio = candidate.tls_depth_ratio
+        if depth_ratio is None or not np.isfinite(depth_ratio):
+            depth_ratio = 1.0
+
+        return np.array([epoch_distance, phase_agreement, depth_ratio], dtype=float)
 
     def fit(self, train_candidates: list) -> 'ConsistencyScoreNormalizer':
         """Fit min-max on proper-training candidate consistency features."""
@@ -331,23 +379,21 @@ class ConsistencyScoreNormalizer:
 
         Higher = more consistent with the TLS periodic model
         (i.e., candidate aligns well with known transit epochs and depth).
-
-        Note: for anomaly ranking we INVERT this — a candidate that is
-        INCONSISTENT with TLS (novel morphology, unusual depth, off-epoch)
-        may be MORE interesting.  The inversion is handled in pipeline.py
-        when combining with composite_score.
+        Used directly in the ranking blend: alpha*composite + (1-alpha)*consistency.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() first.")
         v = self._feature_vector(candidate)
         normed = np.clip((v - self._mins) / (self._maxs - self._mins), 0.0, 1.0)
 
-        # epoch_distance: higher is LESS consistent, so invert
+        # epoch_distance: smaller distance = more consistent, so invert
         epoch_score = 1.0 - normed[0]
-        phase_score = normed[1]          # tls_phase_agreement: higher = more consistent
-        # depth_ratio: values near 1.0 are consistent, extreme values less so
-        depth_normed = normed[2]
-        depth_score  = 1.0 - abs(depth_normed - 0.5) * 2.0   # peaks at 0.5 (ratio ~1.0)
-        depth_score  = float(np.clip(depth_score, 0.0, 1.0))
+        # phase_agreement: higher = more consistent (already directional)
+        phase_score = normed[1]
+        # depth_ratio: physically meaningful target is 1.0 (observed ≈ TLS depth).
+        # Score in raw space so the peak is always at ratio=1.0, regardless of the
+        # training distribution used for normalization.
+        depth_ratio = v[2]  # raw value from _feature_vector
+        depth_score = float(np.clip(1.0 - abs(depth_ratio - 1.0), 0.0, 1.0))
 
         return float(np.mean([epoch_score, phase_score, depth_score]))

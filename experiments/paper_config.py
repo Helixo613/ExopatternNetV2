@@ -28,12 +28,13 @@ CALIB_FRACTION  = 0.25  # 25% of non-test stars → calibration (30/120 for full
 # -----------------------------------------------------------------------
 WINDOW_SIZE        = 50
 STRIDE             = 12
-FLAG_QUANTILE      = 0.975      # 97.5th percentile composite threshold
+FLAG_QUANTILE      = 0.975      # 97.5th percentile composite threshold (blueprint D3)
 GAP_TOLERANCE      = 2          # windows
 MAX_EVENT_WINDOWS  = 20
 EVENT_SCORE_METHOD = 'top3_mean'
 TLS_ALPHA          = 0.7        # ranking = 0.7*composite + 0.3*consistency_novelty
 CONTAMINATION      = 0.1
+MAX_TRAIN_WINDOWS  = 200_000    # bound fold-fit RAM via proportional pre-subsampling
 
 # -----------------------------------------------------------------------
 # Conformal calibration

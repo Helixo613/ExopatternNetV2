@@ -77,7 +77,18 @@ class IsolationForestModel(BaseAnomalyModel):
 
 
 class LOFModel(BaseAnomalyModel):
-    """Local Outlier Factor wrapper with unified interface."""
+    """
+    Local Outlier Factor (novelty=True) wrapped in the unified interface.
+
+    Scale ceiling: training is capped at 50,000 windows (LOF is O(n^2) in
+    memory). Beyond that cap the model stops benefiting from additional data.
+    Treat as a bounded baseline; for large corpora rely on IsolationForest
+    whose training path scales naturally.
+    """
+
+    # LOF builds an n×n distance matrix — O(n²) memory.
+    # Cap training samples to avoid OOM on large datasets.
+    MAX_TRAIN_SAMPLES = 50_000
 
     def __init__(self, contamination: float = 0.1, n_neighbors: int = 20,
                  random_state: int = 42):
@@ -91,7 +102,19 @@ class LOFModel(BaseAnomalyModel):
         )
 
     def fit(self, X: np.ndarray) -> 'LOFModel':
-        X_scaled = self.scaler.fit_transform(X)
+        n_orig = len(X)
+        if n_orig > self.MAX_TRAIN_SAMPLES:
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(n_orig, self.MAX_TRAIN_SAMPLES, replace=False)
+            X_sub = X[idx]
+            logger.info(
+                f"LOF: subsampled {n_orig} → {self.MAX_TRAIN_SAMPLES} "
+                "windows to avoid O(n²) OOM"
+            )
+        else:
+            X_sub = X
+        # Fit scaler on the same subset the model trains on
+        X_scaled = self.scaler.fit_transform(X_sub)
         self.model.fit(X_scaled)
         self.is_fitted = True
         return self
@@ -106,7 +129,16 @@ class LOFModel(BaseAnomalyModel):
 
 
 class OneClassSVMModel(BaseAnomalyModel):
-    """One-Class SVM for anomaly detection."""
+    """
+    One-class SVM (RBF kernel) wrapped in the unified interface.
+
+    Scale ceiling: training is capped at 50,000 windows (kernel SVM is
+    O(n^2)–O(n^3)). Beyond that cap the model stops benefiting from additional
+    data. Treat as a bounded baseline; for large corpora rely on IsolationForest
+    whose training path scales naturally.
+    """
+    # RBF kernel OCSVM is O(n²) — subsample to keep training tractable.
+    MAX_TRAIN_SAMPLES = 50_000
 
     def __init__(self, contamination: float = 0.1, kernel: str = 'rbf',
                  random_state: int = 42):
@@ -119,7 +151,19 @@ class OneClassSVMModel(BaseAnomalyModel):
         )
 
     def fit(self, X: np.ndarray) -> 'OneClassSVMModel':
-        X_scaled = self.scaler.fit_transform(X)
+        n_orig = len(X)
+        if n_orig > self.MAX_TRAIN_SAMPLES:
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(n_orig, self.MAX_TRAIN_SAMPLES, replace=False)
+            X_sub = X[idx]
+            logger.info(
+                f"OCSVM: subsampled {n_orig} → {self.MAX_TRAIN_SAMPLES} "
+                "windows to avoid O(n²) training cost"
+            )
+        else:
+            X_sub = X
+        # Fit scaler on the same subset the model trains on
+        X_scaled = self.scaler.fit_transform(X_sub)
         self.model.fit(X_scaled)
         self.is_fitted = True
         return self
@@ -160,7 +204,6 @@ class DBSCANModel(BaseAnomalyModel):
         For new data, use distance to nearest core point.
         Points far from all core points are anomalies.
         """
-        X_scaled = self.scaler.transform(X)
         scores = self.score_samples(X)
         # Use contamination-based threshold on scores
         threshold = np.percentile(scores, 100 * self.contamination)

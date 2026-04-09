@@ -237,7 +237,11 @@ def inject_and_recover(
         for t_mid in transit_times:
             if abs(cand.center_time - t_mid) <= recovery_half_window:
                 recovered = True
-                cand_score = getattr(cand, 'composite_score', 0.0)
+                cand_score = getattr(
+                    cand,
+                    'ranking_score',
+                    getattr(cand, 'composite_score', 0.0),
+                )
                 if best_score is None or cand_score > best_score:
                     best_score = cand_score
                     best_center = cand.center_time
@@ -308,6 +312,7 @@ def run_injection_recovery(
     r_star_rsun: float = 1.0,
     recovery_window_factor: float = 1.5,
     progress_callback=None,
+    n_workers: int = 8,
 ) -> InjectionRecoveryResult:
     """
     Run the full 8×8 injection-recovery grid.
@@ -335,6 +340,9 @@ def run_injection_recovery(
     if period_grid is None:
         period_grid = PERIOD_GRID_DAYS
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed as futures_as_completed
+    import threading
+
     rng = np.random.default_rng(rng_seed)
     star_ids = list(light_curves.keys())
 
@@ -344,72 +352,83 @@ def run_injection_recovery(
     all_trials: List[InjectionTrial] = []
 
     total_trials = n_r * n_p * n_trials
-    completed = 0
 
     logger.info(
         f"Starting injection-recovery: {n_r}×{n_p} grid, "
-        f"{n_trials} trials/cell, {total_trials} total"
+        f"{n_trials} trials/cell, {total_trials} total, {n_workers} workers"
     )
 
+    # Pre-generate all trial parameters deterministically before parallelising
+    trial_specs = []
     for i, radius in enumerate(radius_grid):
         for j, period in enumerate(period_grid):
-            n_recovered_cell = 0
-
             for _ in range(n_trials):
-                # Pick a random star
-                star_id = rng.choice(star_ids)
+                star_id = str(rng.choice(star_ids))
                 df = light_curves[star_id]
                 time = df['time'].values
-
                 t_min, t_max = float(time.min()), float(time.max())
 
-                # Skip if period is longer than the light curve
                 if period > (t_max - t_min):
-                    all_trials.append(InjectionTrial(
-                        params=InjectionParams(
-                            radius_rearth=radius, period_days=period,
-                            t0=t_min, impact_b=0.0, r_star_rsun=r_star_rsun
-                        ),
-                        star_id=star_id, recovered=False,
-                        n_candidates_generated=0,
-                    ))
-                    completed += 1
-                    continue
+                    # Uninformative — record as not recovered without running pipeline
+                    trial_specs.append((i, j, None, star_id, radius, period, t_min))
+                else:
+                    t0 = float(rng.uniform(t_min, t_min + period))
+                    b  = float(rng.uniform(0.0, 0.8))
+                    trial_specs.append((i, j, (t0, b), star_id, radius, period, t_min))
 
-                # Random epoch and impact parameter
-                t0 = float(rng.uniform(t_min, t_min + period))
-                b  = float(rng.uniform(0.0, 0.8))
+    completed_count = 0
+    lock = threading.Lock()
 
-                params = InjectionParams(
-                    radius_rearth=radius,
-                    period_days=period,
-                    t0=t0,
-                    impact_b=b,
-                    r_star_rsun=r_star_rsun,
-                )
-
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    trial = inject_and_recover(
-                        df, params, pipeline_fn,
-                        star_id=star_id,
-                        recovery_window_factor=recovery_window_factor,
-                    )
-
-                all_trials.append(trial)
-                if trial.recovered:
-                    n_recovered_cell += 1
-
-                completed += 1
-                if progress_callback is not None:
-                    progress_callback(completed, total_trials)
-
-            completeness[i, j] = n_recovered_cell / n_trials
-            logger.debug(
-                f"  R={radius:.1f} R⊕  P={period:.0f}d: "
-                f"{n_recovered_cell}/{n_trials} recovered "
-                f"({100*completeness[i,j]:.0f}%)"
+    def _run_trial(spec):
+        i, j, random_params, star_id, radius, period, t_min = spec
+        if random_params is None:
+            return i, j, InjectionTrial(
+                params=InjectionParams(
+                    radius_rearth=radius, period_days=period,
+                    t0=t_min, impact_b=0.0, r_star_rsun=r_star_rsun,
+                ),
+                star_id=star_id, recovered=False, n_candidates_generated=0,
             )
+        t0, b = random_params
+        params = InjectionParams(
+            radius_rearth=radius, period_days=period,
+            t0=t0, impact_b=b, r_star_rsun=r_star_rsun,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trial = inject_and_recover(
+                light_curves[star_id], params, pipeline_fn,
+                star_id=star_id,
+                recovery_window_factor=recovery_window_factor,
+            )
+        return i, j, trial
+
+    # Cell-level recovery counts (need lock-protected accumulation)
+    cell_recovered = np.zeros((n_r, n_p), dtype=int)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        future_map = {executor.submit(_run_trial, spec): spec for spec in trial_specs}
+        for future in futures_as_completed(future_map):
+            try:
+                i, j, trial = future.result(timeout=300)
+                with lock:
+                    all_trials.append(trial)
+                    if trial.recovered:
+                        cell_recovered[i, j] += 1
+                    completed_count += 1
+                    if progress_callback is not None:
+                        progress_callback(completed_count, total_trials)
+            except Exception as e:
+                spec = future_map[future]
+                logger.warning(f"Trial failed for spec {spec[:4]}: {e}")
+                with lock:
+                    completed_count += 1
+
+    # Build completeness matrix — use cell_recovered / n_trials directly.
+    # cell_recovered was accumulated atomically during parallel execution.
+    for i in range(n_r):
+        for j in range(n_p):
+            completeness[i, j] = cell_recovered[i, j] / max(n_trials, 1)
 
     n_total_recovered = sum(t.recovered for t in all_trials)
     logger.info(

@@ -26,7 +26,7 @@ class LightCurvePreprocessor:
     def __init__(self):
         self.scaler_params = None
 
-    def preprocess(self, df: pd.DataFrame, normalize: bool = True) -> pd.DataFrame:
+    def preprocess(self, df: pd.DataFrame, normalize: bool = True, sigma: float = 5.0) -> pd.DataFrame:
         """
         Preprocess light curve data.
 
@@ -40,7 +40,7 @@ class LightCurvePreprocessor:
         df = df.copy()
 
         # Remove outliers using sigma clipping
-        df = self._sigma_clip(df, sigma=5)
+        df = self._sigma_clip(df, sigma=sigma)
 
         # Normalize flux if requested
         if normalize:
@@ -111,7 +111,8 @@ class LightCurvePreprocessor:
         return df
 
     def extract_features(self, df: pd.DataFrame, window_size: int = 50,
-                         feature_groups: Optional[List[str]] = None) -> np.ndarray:
+                         feature_groups: Optional[List[str]] = None,
+                         stride: Optional[int] = None) -> np.ndarray:
         """
         Extract features from light curve using sliding windows.
 
@@ -137,7 +138,10 @@ class LightCurvePreprocessor:
         time = df['time'].values
 
         n_points = len(flux)
-        stride = max(1, window_size // 4)  # 75% overlap
+        if stride is None:
+            stride = max(1, window_size // 4)  # 75% overlap default
+        else:
+            stride = max(1, stride)
         features_list = []
 
         for i in range(0, n_points - window_size + 1, stride):
@@ -172,6 +176,7 @@ class LightCurvePreprocessor:
         window_size: int = 50,
         feature_groups: Optional[List[str]] = None,
         labels: Optional[np.ndarray] = None,
+        stride: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """
         Extract features AND return per-window metadata and labels.
@@ -205,7 +210,10 @@ class LightCurvePreprocessor:
         flux = df['flux'].values
         time = df['time'].values
         n_points = len(flux)
-        stride = max(1, window_size // 4)
+        if stride is None:
+            stride = max(1, window_size // 4)  # 75% overlap default
+        else:
+            stride = max(1, stride)
 
         if labels is None:
             labels = np.zeros(n_points, dtype=int)
@@ -404,13 +412,12 @@ class LightCurvePreprocessor:
         if variance < 1e-12:
             return [0.0] * 5
 
-        # Compute ACF for lags 0..min(n//2, 30)
+        # Vectorized ACF via np.correlate (O(n²) but in C, not Python loops)
         max_lag = min(n // 2, 30)
-        acf = np.zeros(max_lag + 1)
-        for lag in range(max_lag + 1):
-            if lag >= n:
-                break
-            acf[lag] = np.mean(flux_centered[:n - lag] * flux_centered[lag:]) / variance
+        full_corr = np.correlate(flux_centered, flux_centered, mode='full')
+        # full_corr has length 2n-1; the zero-lag is at index n-1
+        mid = n - 1
+        acf = full_corr[mid:mid + max_lag + 1] / (variance * n)
 
         # ACF at specific lags
         acf_lag1 = float(acf[1]) if len(acf) > 1 else 0.0
@@ -418,11 +425,9 @@ class LightCurvePreprocessor:
         acf_lag10 = float(acf[10]) if len(acf) > 10 else 0.0
 
         # First zero crossing of ACF
-        first_zero = float(max_lag)  # default: no zero crossing
-        for lag in range(1, len(acf)):
-            if acf[lag] <= 0:
-                first_zero = float(lag)
-                break
+        neg_mask = acf[1:] <= 0
+        neg_indices = np.nonzero(neg_mask)[0]
+        first_zero = float(neg_indices[0] + 1) if len(neg_indices) > 0 else float(max_lag)
 
         # Decay rate: fit exponential to ACF envelope
         # Simplified: ratio of acf[1] to acf[5]

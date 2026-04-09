@@ -38,6 +38,12 @@ def main():
                         help='Max quarters/sectors per target (default: all, smoke-test: 3)')
     parser.add_argument('--smoke-test', action='store_true',
                         help='Quick smoke test: download 5 planets + 5 normal (3 quarters each)')
+    parser.add_argument('--workers', type=int, default=8,
+                        help='Parallel download threads (default: 8)')
+    parser.add_argument('--no-cloud', action='store_true',
+                        help='Disable S3 cloud downloads (use MAST servers)')
+    parser.add_argument('--slow', action='store_true',
+                        help='Use old sequential download (not recommended)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Verbose logging')
 
@@ -62,25 +68,43 @@ def main():
     print(f"Planet hosts:   {args.n_planets}")
     print(f"Normal stars:   {args.n_normal}")
     print(f"Output dir:     {args.output_dir}")
-    print(f"Delay:          {args.delay}s")
+    print(f"Workers:        {args.workers}")
+    print(f"Cloud (S3):     {not args.no_cloud}")
     print()
 
-    acquisitor = MastDataAcquisitor(output_dir=args.output_dir)
-
-    metadata = acquisitor.build_dataset(
-        n_planet_hosts=args.n_planets,
-        n_non_planet=args.n_normal,
-        mission=args.mission,
-        delay_between=args.delay,
-        max_quarters=args.max_quarters,
+    acquisitor = MastDataAcquisitor(
+        output_dir=args.output_dir,
+        enable_cloud=not args.no_cloud,
     )
 
-    print(f"\nDataset saved to {args.output_dir}/")
-    print(f"Total targets: {len(metadata)}")
-    if len(metadata) > 0:
-        print(f"Planet hosts:  {(metadata['label_type'] == 'transit').sum()}")
-        print(f"Normal stars:  {(metadata['label_type'] == 'normal').sum()}")
-        print(f"Total points:  {metadata['n_points'].sum():,}")
+    if args.slow:
+        # Legacy sequential download
+        metadata = acquisitor.build_dataset(
+            n_planet_hosts=args.n_planets,
+            n_non_planet=args.n_normal,
+            mission=args.mission,
+            delay_between=args.delay,
+            max_quarters=args.max_quarters,
+        )
+    else:
+        # Fast parallel download (default)
+        metadata = acquisitor.build_dataset_fast(
+            n_planet_hosts=args.n_planets,
+            n_non_planet=args.n_normal,
+            mission=args.mission,
+            n_workers=args.workers,
+            max_quarters=args.max_quarters,
+        )
+
+    try:
+        print(f"\nDataset saved to {args.output_dir}/")
+        print(f"Total targets: {len(metadata)}")
+        if len(metadata) > 0:
+            print(f"Planet hosts:  {(metadata['label_type'] == 'transit').sum()}")
+            print(f"Normal stars:  {(metadata['label_type'] == 'normal').sum()}")
+            print(f"Total points:  {metadata['n_points'].sum():,}")
+    except ValueError:
+        pass  # stdout closed in background mode
 
 
 if __name__ == '__main__':
