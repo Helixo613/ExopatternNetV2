@@ -319,7 +319,7 @@ def run_star_cv(
 
         # Fit pipeline
         pipeline = RankingPipeline(config)
-        pipeline.fit(train_dfs, tls_cache=tls_cache)
+        pipeline.fit(train_dfs, tls_cache=tls_cache, gt_by_star=gt_by_star)
 
         # Generate candidates on training stars (for consistency normalizer)
         train_cands = pipeline.score_stars(train_dfs, tls_cache)

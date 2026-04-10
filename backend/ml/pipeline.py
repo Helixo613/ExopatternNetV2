@@ -140,6 +140,7 @@ class RankingPipeline:
         self,
         train_dfs: Dict[str, pd.DataFrame],
         tls_cache: Optional[Dict[str, Dict]] = None,
+        gt_by_star: Optional[Dict[str, List]] = None,
     ) -> 'RankingPipeline':
         """
         Fit models and normalizers on proper-training stars.
@@ -161,9 +162,25 @@ class RankingPipeline:
         logger.info(f"Extracting features for {len(train_dfs)} training stars...")
         all_features: List[np.ndarray] = []
         total_windows = 0
+        total_excluded = 0
 
         for star_id, df in train_dfs.items():
-            feats = self._extract_star_features(df, star_id, tls_cache)
+            extracted = self._extract_star_features(df, star_id, tls_cache)
+            if extracted is None:
+                continue
+
+            feats, meta = extracted
+            if gt_by_star is not None:
+                keep_mask = _build_training_keep_mask(meta, gt_by_star.get(star_id, []))
+                excluded = int((~keep_mask).sum())
+                if excluded > 0:
+                    feats = feats[keep_mask]
+                    total_excluded += excluded
+                    logger.info(
+                        f"{star_id}: excluded {excluded} GT-overlapping training windows "
+                        f"({len(feats)} kept)"
+                    )
+
             if feats is not None and len(feats) > 0:
                 all_features.append(feats)
                 total_windows += len(feats)
@@ -171,7 +188,10 @@ class RankingPipeline:
         if not all_features:
             raise ValueError("No features extracted from training stars.")
 
-        logger.info(f"Collected {total_windows} windows from {len(all_features)} stars")
+        logger.info(
+            f"Collected {total_windows} training windows from {len(all_features)} stars"
+            + (f" after excluding {total_excluded} GT-overlapping windows" if total_excluded else "")
+        )
 
         mtw = cfg.max_train_windows
         if mtw is not None and total_windows > mtw:
@@ -497,7 +517,7 @@ class RankingPipeline:
         df: pd.DataFrame,
         star_id: str,
         tls_cache: Optional[Dict[str, Dict]],
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[Tuple[np.ndarray, List[Dict]]]:
         """Extract window features (+ TLS if enabled) for one star.
 
         Check order: in-memory cache → disk feature store → full extraction.
@@ -505,8 +525,8 @@ class RankingPipeline:
         """
         # 1. In-memory cache hit
         if star_id in self._feature_cache:
-            feats_raw, _ = self._feature_cache[star_id]
-            return _impute_nan(feats_raw.copy())
+            feats_raw, meta = self._feature_cache[star_id]
+            return _impute_nan(feats_raw.copy()), meta
 
         # 2. Disk feature store hit
         if self._feature_store is not None:
@@ -515,7 +535,7 @@ class RankingPipeline:
                 feats_f32, meta = stored
                 self._feature_cache[star_id] = (feats_f32, meta)
                 logger.debug(f"{star_id}: features loaded from disk store")
-                return _impute_nan(feats_f32.copy())
+                return _impute_nan(feats_f32.copy()), meta
 
         # 3. Full extraction
         cfg = self.config
@@ -538,7 +558,7 @@ class RankingPipeline:
             # Persist to disk store for cross-fold / cross-experiment reuse
             if self._feature_store is not None:
                 self._feature_store.save(star_id, self._get_config_hash(), feats_f32, meta)
-            return _impute_nan(feats_f32.copy())
+            return _impute_nan(feats_f32.copy()), meta
         except Exception as e:
             logger.warning(f"{star_id}: feature extraction failed: {e}")
             return None
@@ -606,6 +626,29 @@ def _impute_nan(X: np.ndarray, fill_values: Optional[np.ndarray] = None) -> np.n
     nan_mask = np.isnan(X)
     X[nan_mask] = np.take(medians, np.where(nan_mask)[1])
     return X
+
+
+def _build_training_keep_mask(metadata: List[Dict], gt_events: List) -> np.ndarray:
+    """
+    Return a boolean mask that keeps only windows not overlapping known GT transits.
+
+    GT intervals are already buffered in event_evaluation, so any direct interval
+    overlap is sufficient here.
+    """
+    if not metadata:
+        return np.zeros(0, dtype=bool)
+    if not gt_events:
+        return np.ones(len(metadata), dtype=bool)
+
+    starts = np.array([m['start_time'] for m in metadata], dtype=float)
+    ends = np.array([m['end_time'] for m in metadata], dtype=float)
+    keep = np.ones(len(metadata), dtype=bool)
+
+    for gt in gt_events:
+        overlap = (starts <= gt.end_time) & (ends >= gt.start_time)
+        keep[overlap] = False
+
+    return keep
 
 
 def _estimate_candidate_flux_dips(
