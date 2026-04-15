@@ -1174,6 +1174,127 @@ def experiment_6_bls_baseline(dataset: Dict, dev_mode: bool = False) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Experiment 7: TLS baseline
+# ---------------------------------------------------------------------------
+
+def experiment_7_tls_baseline(dataset: Dict) -> Dict:
+    """
+    TLS (Transit Least Squares) baseline comparison.
+
+    Uses the precomputed TLS disk cache (same one used for pipeline features).
+    Metrics are computed with a direct per-star loop rather than event_metrics()
+    to avoid O(n_cands × n_gt) cost with 100k+ TLS predictions.
+
+    For each star at a given SDE threshold:
+      - System recall: SDE >= threshold → star is "detected"
+      - Event recall:  fraction of GT events whose center falls within
+                       [t0 + n*P - radius, t0 + n*P + radius] for any integer n
+
+    SDE thresholds tested: 5, 7, 9 — all three reported for robustness.
+    """
+    logger.info("\n" + "="*60)
+    logger.info("EXPERIMENT 7: TLS baseline")
+    logger.info("="*60)
+
+    dfs        = dataset['dfs']
+    gt_by_star = dataset['gt_events_by_star']
+    star_ids   = dataset['star_ids']
+
+    # Load TLS cache from disk (already computed, instantaneous)
+    tls_cache = precompute_tls_cache(dfs)
+
+    COVERAGE_HALF_DAYS = 0.5
+    BKJD_OFFSET = 2454833.0
+
+    def _is_gt_covered(gt_center: float, t0: float, period: float, radius: float) -> bool:
+        """True if a GT transit center falls within any TLS-predicted window."""
+        n = round((gt_center - t0) / period)
+        predicted = t0 + n * period
+        return abs(predicted - gt_center) <= radius
+
+    def _evaluate_at_sde(min_sde: float) -> Dict:
+        n_hosts = 0
+        n_sys_detected = 0
+        n_gt_total = 0
+        n_gt_detected = 0
+        n_stars_with_cands = 0
+
+        for sid in star_ids:
+            tls = tls_cache.get(sid, {})
+            sde    = tls.get('tls_sde', 0.0) or 0.0
+            period = tls.get('tls_period', float('nan'))
+            t0     = tls.get('tls_t0',     float('nan'))
+            dur    = tls.get('tls_duration', float('nan'))
+            gt     = gt_by_star.get(sid, [])
+
+            is_host = len(gt) > 0
+            if is_host:
+                n_hosts += 1
+
+            # Star not detected by TLS at this threshold
+            if sde < min_sde or np.isnan(period) or np.isnan(t0) or period <= 0:
+                n_gt_total += len(gt)
+                continue
+
+            n_stars_with_cands += 1
+
+            # Convert t0 from full BJD to BKJD if needed
+            t0_bkjd = t0 - BKJD_OFFSET if t0 > BKJD_OFFSET else t0
+            half_dur = (dur / 24.0 / 2.0) if (not np.isnan(dur) and dur > 0) else 0.0
+            radius = max(half_dur + COVERAGE_HALF_DAYS, COVERAGE_HALF_DAYS)
+
+            # System recall: at least one GT event covered?
+            n_gt_total += len(gt)
+            n_covered_this_star = 0
+            for gt_ev in gt:
+                if _is_gt_covered(gt_ev.center_time, t0_bkjd, period, radius):
+                    n_covered_this_star += 1
+
+            n_gt_detected += n_covered_this_star
+            if is_host and n_covered_this_star > 0:
+                n_sys_detected += 1
+
+        system_recall = n_sys_detected / n_hosts if n_hosts > 0 else float('nan')
+        event_recall  = n_gt_detected  / n_gt_total if n_gt_total > 0 else float('nan')
+
+        logger.info(
+            f"  SDE>={min_sde:.0f}: {n_stars_with_cands}/{len(star_ids)} stars detected  "
+            f"system_recall={system_recall:.4f}  event_recall={event_recall:.4f}"
+        )
+        return {
+            'system_recall':          round(system_recall, 4),
+            'event_recall':           round(event_recall,  4),
+            'n_stars_detected':       n_stars_with_cands,
+            'n_hosts':                n_hosts,
+            'n_sys_detected':         n_sys_detected,
+            'n_gt_total':             n_gt_total,
+            'n_gt_detected':          n_gt_detected,
+        }
+
+    sde_thresholds = [5.0, 7.0, 9.0]
+    results_by_sde = {}
+
+    for sde_thresh in sde_thresholds:
+        m = _evaluate_at_sde(sde_thresh)
+        results_by_sde[f'sde_{int(sde_thresh)}'] = m
+
+    logger.info("\n--- TLS Baseline Results ---")
+    logger.info(f"  {'Metric':25s}  " + "  ".join(f"SDE>={t:.0f}" for t in sde_thresholds))
+    for k in ['system_recall', 'event_recall']:
+        row = f"  {k:25s}"
+        for t in sde_thresholds:
+            val = results_by_sde[f'sde_{int(t)}'].get(k, float('nan'))
+            row += f"  {val:8.4f}"
+        logger.info(row)
+
+    return {
+        'results_by_sde': results_by_sde,
+        'sde_thresholds': sde_thresholds,
+        'n_stars': len(star_ids),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1283,6 +1404,13 @@ def main() -> None:
         all_results['experiment_6'] = res
         _save_json(res, Path(RAW_DIR) / 'experiment_6_bls_baseline.json')
         logger.info(f"Experiment 6 done in {time.time()-t0:.1f}s")
+
+    if 7 in to_run:
+        t0 = time.time()
+        res = experiment_7_tls_baseline(dataset)
+        all_results['experiment_7'] = res
+        _save_json(res, Path(RAW_DIR) / 'experiment_7_tls_baseline.json')
+        logger.info(f"Experiment 7 done in {time.time()-t0:.1f}s")
 
     # Save combined results
     _save_json(all_results, Path(RESULTS_DIR) / 'all_results.json')
