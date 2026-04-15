@@ -55,6 +55,8 @@ from backend.ml.injection import (
     completeness_contours,
 )
 from backend.ml.tls_features import extract_tls_features
+from backend.ml.periodic_propagation import apply_propagation
+from backend.ml.events import CandidateEvent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -339,6 +341,16 @@ def run_star_cv(
             conf_diag = {'n_null': 0, 'warning': 'empty null set'}
 
         test_cands = pipeline.score_stars(test_dfs, tls_cache)
+
+        # Period-aware propagation: add phantom candidates at all TLS-predicted
+        # transit times not already covered by a real candidate.
+        # Phantoms score below every real candidate (no precision@K impact).
+        if tls_cache:
+            test_cands = apply_propagation(
+                test_cands, test_ids, tls_cache, dfs,
+                min_sde=5.0, coverage_half_days=0.5,
+            )
+
         all_gt = []
         for sid in test_ids:
             all_gt.extend(gt_by_star.get(sid, []))
@@ -996,6 +1008,172 @@ def experiment_5_injection_recovery(
 
 
 # ---------------------------------------------------------------------------
+# Experiment 6: BLS baseline
+# ---------------------------------------------------------------------------
+
+def experiment_6_bls_baseline(dataset: Dict, dev_mode: bool = False) -> Dict:
+    """
+    BLS (Box Least Squares) baseline comparison.
+
+    Runs astropy's BoxLeastSquares on all stars in parallel (16 workers).
+    The best-fit period + t0 + duration are used to enumerate transit candidates
+    with the same logic as period-aware propagation.  Results are evaluated with
+    the same event_metrics() function for a direct comparison table.
+
+    This is a *blind* BLS run — no training set, no anomaly scores.
+    BLS candidates are assigned a uniform composite_score of 1.0 and ranked
+    by transit depth (negative depth → more anomalous).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    logger.info("\n" + "="*60)
+    logger.info("EXPERIMENT 6: BLS baseline")
+    logger.info("="*60)
+
+    try:
+        from astropy.timeseries import BoxLeastSquares
+        import astropy.units as u
+    except ImportError:
+        logger.warning("astropy not installed — skipping Experiment 6. pip install astropy")
+        return {'skipped': True, 'reason': 'astropy not installed'}
+
+    dfs          = dataset['dfs']
+    gt_by_star   = dataset['gt_events_by_star']
+    star_ids     = dataset['star_ids']
+    n_workers    = 4 if dev_mode else 16
+
+    # Period grid: 0.5 – 200 days, log-spaced, 2000 points (fast BLS)
+    period_min  = 0.5
+    period_max  = 200.0
+    n_periods   = 500 if dev_mode else 2000
+
+    def _bls_one_star(star_id: str):
+        """Run BLS on one star and return CandidateEvent list."""
+        df = dfs.get(star_id)
+        if df is None or 'time' not in df.columns or 'flux' not in df.columns:
+            return star_id, []
+
+        time_arr = df['time'].dropna().values
+        flux_arr = df['flux'].dropna().values
+
+        # Align lengths after dropna
+        valid = ~(np.isnan(time_arr) | np.isnan(flux_arr))
+        time_arr = time_arr[valid]
+        flux_arr = flux_arr[valid]
+
+        if len(time_arr) < 50:
+            return star_id, []
+
+        try:
+            # Normalise flux to zero-mean (BLS works on fractional flux deviations)
+            flux_norm = flux_arr / np.nanmedian(flux_arr) - 1.0
+
+            # Use .power() with explicit period grid (autopower() doesn't accept period=)
+            periods = np.geomspace(period_min, period_max, n_periods) * u.day
+            durations = np.array([0.05, 0.1, 0.2]) * u.day
+            bls = BoxLeastSquares(time_arr * u.day, flux_norm)
+            result = bls.power(periods, durations, objective='snr')
+
+            best_idx = np.argmax(result.power)
+            best_period = float(result.period[best_idx].value)
+            best_t0     = float(result.transit_time[best_idx].value)
+            best_dur    = float(result.duration[best_idx].value)
+            best_depth  = float(result.depth[best_idx])
+            best_power  = float(result.power[best_idx])
+
+            # Enumerate all transit centers within the light curve
+            time_min = float(time_arr.min())
+            time_max = float(time_arr.max())
+            half_dur = best_dur / 2.0 + 0.5  # same coverage radius as propagation
+
+            n_start = int(np.floor((time_min - best_t0) / best_period))
+            n_end   = int(np.ceil( (time_max - best_t0) / best_period))
+            centers = [best_t0 + n * best_period for n in range(n_start, n_end + 1)
+                       if time_min <= best_t0 + n * best_period <= time_max]
+
+            # Score: use BLS power (higher power = more transit-like)
+            cands = []
+            for tc in centers:
+                cand = CandidateEvent(
+                    star_id=star_id,
+                    start_time=tc - half_dur,
+                    end_time=tc + half_dur,
+                    center_time=tc,
+                    window_indices=[],
+                    n_windows=0,
+                    model_scores={'bls_power': best_power, 'bls_depth': best_depth},
+                    composite_score=best_power,
+                    ranking_score=best_power,
+                )
+                cands.append(cand)
+            return star_id, cands
+
+        except Exception as e:
+            logger.debug(f"  BLS failed for {star_id}: {e}")
+            return star_id, []
+
+    logger.info(f"Running BLS on {len(star_ids)} stars ({n_workers} workers)...")
+    all_bls_cands: List[CandidateEvent] = []
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_bls_one_star, sid): sid for sid in star_ids}
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            try:
+                sid, cands = future.result()
+                all_bls_cands.extend(cands)
+                if completed % 20 == 0 or completed == len(star_ids):
+                    logger.info(f"  [{completed}/{len(star_ids)}] done, {len(all_bls_cands)} total candidates")
+            except Exception as e:
+                sid = futures[future]
+                logger.warning(f"  BLS future failed for {sid}: {e}")
+
+    logger.info(f"BLS produced {len(all_bls_cands)} total transit candidates")
+
+    # Evaluate with same event_metrics — all stars together (no CV split needed for baseline)
+    all_gt = []
+    for sid in star_ids:
+        all_gt.extend(gt_by_star.get(sid, []))
+
+    metrics = event_metrics(all_bls_cands, all_gt)
+
+    # Per-star system recall
+    from collections import defaultdict
+    from backend.ml.event_evaluation import match_events
+    cands_by_star = defaultdict(list)
+    for c in all_bls_cands:
+        cands_by_star[c.star_id].append(c)
+
+    n_hosts = 0
+    n_sys_detected = 0
+    for sid in star_ids:
+        gt = gt_by_star.get(sid, [])
+        if not gt:
+            continue
+        n_hosts += 1
+        cands = cands_by_star.get(sid, [])
+        if cands:
+            _, _, detected_gt, _ = match_events(cands, gt)
+            if detected_gt:
+                n_sys_detected += 1
+
+    system_recall = n_sys_detected / n_hosts if n_hosts > 0 else float('nan')
+    metrics['system_recall'] = system_recall
+
+    logger.info("\n--- BLS Baseline Results ---")
+    for k in ['recall_at_k', 'precision_at_k', 'event_recall', 'event_precision', 'event_f1', 'au_pr']:
+        logger.info(f"  {k:25s}: {metrics.get(k, float('nan')):.4f}")
+    logger.info(f"  {'system_recall':25s}: {system_recall:.4f}")
+
+    return {
+        'metrics': metrics,
+        'n_bls_candidates': len(all_bls_cands),
+        'n_stars': len(star_ids),
+        'n_ground_truth_events': len(all_gt),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1011,7 +1189,7 @@ def main() -> None:
         description='Run ExoPattern v3.1 paper experiments'
     )
     parser.add_argument(
-        '--exp', type=str, default='1,2,3,4,5',
+        '--exp', type=str, default='1,2,3,4,5,6',
         help='Comma-separated experiment numbers to run (default: all)',
     )
     parser.add_argument(
@@ -1098,6 +1276,13 @@ def main() -> None:
         all_results['experiment_5'] = res
         _save_json(res, Path(RAW_DIR) / 'experiment_5_injection.json')
         logger.info(f"Experiment 5 done in {time.time()-t0:.1f}s")
+
+    if 6 in to_run:
+        t0 = time.time()
+        res = experiment_6_bls_baseline(dataset, dev_mode=args.dev)
+        all_results['experiment_6'] = res
+        _save_json(res, Path(RAW_DIR) / 'experiment_6_bls_baseline.json')
+        logger.info(f"Experiment 6 done in {time.time()-t0:.1f}s")
 
     # Save combined results
     _save_json(all_results, Path(RESULTS_DIR) / 'all_results.json')
