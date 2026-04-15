@@ -266,6 +266,28 @@ class LightCurvePreprocessor:
             metadata_list,
         )
 
+    def extract_window_features(
+        self,
+        window_flux: np.ndarray,
+        window_time: np.ndarray,
+        feature_groups=None,
+    ) -> List[float]:
+        """Extract all features for a single pre-sliced window (used by cached injection)."""
+        if feature_groups is None:
+            feature_groups = ['statistical', 'frequency', 'wavelet', 'autocorrelation', 'shape']
+        feat: List[float] = []
+        if 'statistical' in feature_groups:
+            feat.extend(self._extract_statistical_features(window_flux, window_time))
+        if 'frequency' in feature_groups:
+            feat.extend(self._extract_frequency_features(window_flux, window_time))
+        if 'wavelet' in feature_groups:
+            feat.extend(self._extract_wavelet_features(window_flux))
+        if 'autocorrelation' in feature_groups:
+            feat.extend(self._extract_autocorrelation_features(window_flux))
+        if 'shape' in feature_groups:
+            feat.extend(self._extract_shape_features(window_flux))
+        return feat
+
     def _extract_statistical_features(self, flux: np.ndarray,
                                        time: np.ndarray) -> List[float]:
         """

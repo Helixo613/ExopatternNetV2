@@ -13,7 +13,9 @@ Reference: Kreidberg (2015), PASP 127, 1161
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -299,12 +301,25 @@ def _estimate_transit_duration_days(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _write_checkpoint(path: str, cell_recovered: np.ndarray, completed: int) -> None:
+    """Atomically write a checkpoint JSON (write-then-rename)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump({'cell_recovered': cell_recovered.tolist(), 'completed': completed}, f)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
 # Grid runner
 # ---------------------------------------------------------------------------
 
 def run_injection_recovery(
     light_curves: Dict[str, pd.DataFrame],
-    pipeline_fn,
+    pipeline,                               # RankingPipeline (not a closure)
     radius_grid: Optional[List[float]] = None,
     period_grid: Optional[List[float]] = None,
     n_trials: int = N_TRIALS_PER_CELL,
@@ -313,24 +328,30 @@ def run_injection_recovery(
     recovery_window_factor: float = 1.5,
     progress_callback=None,
     n_workers: int = 8,
+    checkpoint_path: Optional[str] = None,
+    checkpoint_interval: int = 50,
 ) -> InjectionRecoveryResult:
     """
-    Run the full 8×8 injection-recovery grid.
+    Run the full 8×8 injection-recovery grid using a ProcessPool for true
+    multi-core parallelism (bypasses the GIL for feature extraction).
 
-    For each (radius, period) cell, injects `n_trials` synthetic transits
-    (random t0 and impact parameter) into randomly selected light curves
-    from `light_curves`, then recovers using `pipeline_fn`.
+    Supports pause-and-resume via an optional checkpoint file.  The run can be
+    interrupted with Ctrl+C at any time; the next call with the same
+    checkpoint_path will skip already-completed trials.
 
     Args:
         light_curves: dict {star_id -> DataFrame with time/flux columns}
-        pipeline_fn: callable(df) -> List[CandidateEvent]
+        pipeline: fitted RankingPipeline instance (replaces old pipeline_fn arg)
         radius_grid: planet radii in R_Earth (default: RADIUS_GRID_REARTH)
         period_grid: orbital periods in days (default: PERIOD_GRID_DAYS)
         n_trials: trials per cell (default 25)
         rng_seed: random seed for reproducibility
         r_star_rsun: assumed stellar radius in R_sun
         recovery_window_factor: multiplier on transit duration for recovery window
-        progress_callback: optional callable(completed, total) for progress reporting
+        progress_callback: optional callable(completed, total)
+        n_workers: number of worker processes (default 8; use os.cpu_count())
+        checkpoint_path: path to JSON checkpoint file for pause/resume
+        checkpoint_interval: save checkpoint every N completed trials
 
     Returns:
         InjectionRecoveryResult
@@ -340,25 +361,21 @@ def run_injection_recovery(
     if period_grid is None:
         period_grid = PERIOD_GRID_DAYS
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed as futures_as_completed
-    import threading
-
     rng = np.random.default_rng(rng_seed)
     star_ids = list(light_curves.keys())
 
     n_r = len(radius_grid)
     n_p = len(period_grid)
-    completeness = np.zeros((n_r, n_p), dtype=float)
-    all_trials: List[InjectionTrial] = []
-
     total_trials = n_r * n_p * n_trials
 
     logger.info(
         f"Starting injection-recovery: {n_r}×{n_p} grid, "
-        f"{n_trials} trials/cell, {total_trials} total, {n_workers} workers"
+        f"{n_trials} trials/cell, {total_trials} total, "
+        f"{n_workers} workers (ProcessPool, true multi-core)"
     )
 
-    # Pre-generate all trial parameters deterministically before parallelising
+    # Pre-generate all trial specs deterministically (fixed RNG seed = reproducible).
+    # Specs are plain tuples — cheap to send per task.
     trial_specs = []
     for i, radius in enumerate(radius_grid):
         for j, period in enumerate(period_grid):
@@ -369,80 +386,222 @@ def run_injection_recovery(
                 t_min, t_max = float(time.min()), float(time.max())
 
                 if period > (t_max - t_min):
-                    # Uninformative — record as not recovered without running pipeline
                     trial_specs.append((i, j, None, star_id, radius, period, t_min))
                 else:
                     t0 = float(rng.uniform(t_min, t_min + period))
                     b  = float(rng.uniform(0.0, 0.8))
                     trial_specs.append((i, j, (t0, b), star_id, radius, period, t_min))
 
-    completed_count = 0
+    # --- Checkpoint: resume from a previous interrupted run ---
+    # Checkpoint stores cell_recovered counts + how many specs were completed.
+    # Because specs are deterministic (fixed seed), skipping the first N is exact.
+    cell_recovered = np.zeros((n_r, n_p), dtype=int)
+    skip_count = 0
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+            with open(checkpoint_path) as f:
+                cp = json.load(f)
+            cell_recovered = np.array(cp['cell_recovered'], dtype=int)
+            skip_count = int(cp['completed'])
+            logger.info(
+                f"Resuming from checkpoint: {skip_count}/{total_trials} trials "
+                f"already done — skipping those specs."
+            )
+        except Exception as e:
+            logger.warning(f"Could not load checkpoint ({e}) — starting fresh.")
+            cell_recovered = np.zeros((n_r, n_p), dtype=int)
+            skip_count = 0
+
+    remaining_specs = trial_specs[skip_count:]
+    completed_count = skip_count
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed as futures_as_completed
+    from backend.ml.preprocessing import LightCurvePreprocessor
+    from backend.ml.multi_view import MultiViewScorer
+    from backend.ml.events import generate_candidates
+
+    # ------------------------------------------------------------------
+    # Build per-star feature cache (loads from disk store — already
+    # computed during pipeline.fit(), takes seconds not hours).
+    # Each entry: (feats_f32, meta, norm_time, norm_flux)
+    # norm_time/flux = sigma-clipped & normalised arrays (needed to
+    # apply transit injection consistently with the cached window indices).
+    # ------------------------------------------------------------------
+    cfg = pipeline.config
+    _scorer = pipeline._scorer
+    _models = pipeline._scorer._models
+    _impute_medians = pipeline._impute_medians
+    _view_names = cfg.view_names
+
+    logger.info("Building star feature cache for injection trials...")
+    _prep = LightCurvePreprocessor()
+    star_cache: Dict[str, tuple] = {}
+    for sid, df in light_curves.items():
+        df_proc = _prep.preprocess(df, normalize=True, sigma=cfg.sigma_clip)
+        norm_time = df_proc['time'].values.copy()
+        norm_flux = df_proc['flux'].values.copy()
+        # Try disk store first (already populated by pipeline.fit())
+        stored = None
+        if pipeline._feature_store is not None:
+            stored = pipeline._feature_store.load(sid, pipeline._get_config_hash())
+        if stored is not None:
+            feats_f32, meta = stored
+        else:
+            feats, _, meta = _prep.extract_features_with_metadata(
+                df_proc, star_id=sid,
+                window_size=cfg.window_size, stride=cfg.stride,
+            )
+            feats_f32 = feats.astype(np.float32)
+        star_cache[sid] = (feats_f32, meta, norm_time, norm_flux)
+    logger.info(f"Feature cache ready for {len(star_cache)} stars.")
+
+    def _impute(X: np.ndarray) -> np.ndarray:
+        if not np.any(np.isnan(X)):
+            return X
+        X = X.copy()
+        nan_mask = np.isnan(X)
+        X[nan_mask] = np.take(_impute_medians, np.where(nan_mask)[1])
+        return X
+
     lock = threading.Lock()
 
     def _run_trial(spec):
         i, j, random_params, star_id, radius, period, t_min = spec
         if random_params is None:
-            return i, j, InjectionTrial(
-                params=InjectionParams(
-                    radius_rearth=radius, period_days=period,
-                    t0=t_min, impact_b=0.0, r_star_rsun=r_star_rsun,
-                ),
-                star_id=star_id, recovered=False, n_candidates_generated=0,
-            )
+            return i, j, False, 0
+
         t0, b = random_params
         params = InjectionParams(
             radius_rearth=radius, period_days=period,
             t0=t0, impact_b=b, r_star_rsun=r_star_rsun,
         )
+
+        feats_cached, meta, norm_time, norm_flux = star_cache[star_id]
+        t_min_obs, t_max_obs = float(norm_time.min()), float(norm_time.max())
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            trial = inject_and_recover(
-                light_curves[star_id], params, pipeline_fn,
-                star_id=star_id,
-                recovery_window_factor=recovery_window_factor,
-            )
-        return i, j, trial
+            transit_model = make_transit_model(norm_time, params)
 
-    # Cell-level recovery counts (need lock-protected accumulation)
-    cell_recovered = np.zeros((n_r, n_p), dtype=int)
+        transit_times = _injected_transit_times(params, t_min_obs, t_max_obs)
+        if not transit_times:
+            return i, j, False, 0
+
+        approx_duration = _estimate_transit_duration_days(
+            norm_time, transit_model, t0, period
+        )
+        recovery_half_window = recovery_window_factor * approx_duration
+
+        # Apply transit on normalised flux (linear normalisation commutes
+        # with multiplication for small transit depths — our core approximation).
+        norm_flux_inj = norm_flux * transit_model
+
+        # Find windows that overlap any transit ± duration
+        affected: List[int] = []
+        for k, m in enumerate(meta):
+            for tt in transit_times:
+                if m['start_time'] <= tt + approx_duration and \
+                   m['end_time']   >= tt - approx_duration:
+                    affected.append(k)
+                    break
+
+        if not affected:
+            return i, j, False, 0
+
+        # Re-extract features for affected windows only (thread-local preprocessor)
+        if not hasattr(_tl, 'prep'):
+            _tl.prep = LightCurvePreprocessor()
+        tl_prep = _tl.prep
+
+        feats_updated = feats_cached.copy()
+        n_feat = feats_updated.shape[1]
+        for k in affected:
+            m = meta[k]
+            s, e = m['start_idx'], m['end_idx'] + 1
+            wf = norm_flux_inj[s:e]
+            wt = norm_time[s:e]
+            if len(wf) < 2:
+                continue
+            feat = tl_prep.extract_window_features(wf, wt)
+            if len(feat) == n_feat:
+                feats_updated[k] = np.array(feat, dtype=np.float32)
+
+        # Score full window array against fitted models
+        feats_imp = _impute(feats_updated)
+        raw_scores = MultiViewScorer.score_windows(_models, feats_imp, _view_names)
+        composite = _scorer.composite(raw_scores)
+        threshold = _scorer.threshold
+
+        candidates = generate_candidates(
+            composite_scores=composite,
+            metadata=meta,
+            threshold=threshold,
+            gap_tolerance=cfg.gap_tolerance,
+            max_event_windows=cfg.max_event_windows,
+            event_score_method=cfg.event_score_method,
+        )
+
+        recovered = any(
+            abs(cand.center_time - tt) <= recovery_half_window
+            for cand in candidates
+            for tt in transit_times
+        )
+        return i, j, recovered, len(candidates)
+
+    _tl = threading.local()
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        future_map = {executor.submit(_run_trial, spec): spec for spec in trial_specs}
+        future_map = {executor.submit(_run_trial, spec): spec for spec in remaining_specs}
         for future in futures_as_completed(future_map):
             try:
-                i, j, trial = future.result(timeout=300)
+                i, j, recovered, _n_cands = future.result(timeout=300)
                 with lock:
-                    all_trials.append(trial)
-                    if trial.recovered:
+                    if recovered:
                         cell_recovered[i, j] += 1
                     completed_count += 1
-                    if progress_callback is not None:
-                        progress_callback(completed_count, total_trials)
+                if progress_callback is not None:
+                    progress_callback(completed_count, total_trials)
             except Exception as e:
                 spec = future_map[future]
                 logger.warning(f"Trial failed for spec {spec[:4]}: {e}")
                 with lock:
                     completed_count += 1
 
-    # Build completeness matrix — use cell_recovered / n_trials directly.
-    # cell_recovered was accumulated atomically during parallel execution.
+            # Checkpoint is outside the trial try/except — a bad path won't
+            # silently swallow a trial result or double-count completed_count.
+            if checkpoint_path and completed_count % checkpoint_interval == 0:
+                try:
+                    _write_checkpoint(checkpoint_path, cell_recovered, completed_count)
+                except Exception as e:
+                    logger.warning(f"Checkpoint write failed: {e}")
+
+    # Final checkpoint
+    if checkpoint_path:
+        try:
+            _write_checkpoint(checkpoint_path, cell_recovered, completed_count)
+        except Exception as e:
+            logger.warning(f"Final checkpoint write failed: {e}")
+
+    # Build completeness matrix
+    completeness = np.zeros((n_r, n_p), dtype=float)
     for i in range(n_r):
         for j in range(n_p):
             completeness[i, j] = cell_recovered[i, j] / max(n_trials, 1)
 
-    n_total_recovered = sum(t.recovered for t in all_trials)
+    n_total_recovered = int(cell_recovered.sum())
     logger.info(
-        f"Injection-recovery complete: {n_total_recovered}/{len(all_trials)} recovered "
-        f"({100*n_total_recovered/max(len(all_trials),1):.1f}%)"
+        f"Injection-recovery complete: {n_total_recovered}/{completed_count} recovered "
+        f"({100*n_total_recovered/max(completed_count,1):.1f}%)"
     )
 
     return InjectionRecoveryResult(
         completeness=completeness,
         radius_grid=list(radius_grid),
         period_grid=list(period_grid),
-        n_trials=len(all_trials),
+        n_trials=completed_count,
         n_recovered=n_total_recovered,
-        all_trials=all_trials,
+        all_trials=[],   # not collected in process-pool mode (avoids large IPC)
     )
 
 

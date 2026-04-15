@@ -133,6 +133,25 @@ class RankingPipeline:
             self._feature_store = StarFeatureStore(self.config.feature_store_dir)
 
     # ------------------------------------------------------------------
+    # Pickle support (for multiprocessing / ProcessPoolExecutor)
+    # ------------------------------------------------------------------
+
+    def __getstate__(self) -> Dict:
+        """Exclude large/unpicklable fields when serialising for worker processes."""
+        state = self.__dict__.copy()
+        state['_feature_cache'] = {}   # huge — not needed in workers (use_cache=False)
+        state['_feature_store'] = None  # may hold file handles; re-opened in __setstate__
+        state['_config_hash'] = None    # recomputed on demand
+        return state
+
+    def __setstate__(self, state: Dict) -> None:
+        self.__dict__.update(state)
+        # Re-open disk feature store if the config path is set
+        if self.config.feature_store_dir:
+            from backend.ml.feature_store import StarFeatureStore
+            self._feature_store = StarFeatureStore(self.config.feature_store_dir)
+
+    # ------------------------------------------------------------------
     # Fit
     # ------------------------------------------------------------------
 
@@ -480,22 +499,71 @@ class RankingPipeline:
         Return a callable pipeline_fn(df) -> List[CandidateEvent] for use
         with injection_recovery.inject_and_recover().
 
-        The returned function assigns a temporary star_id and runs the full
-        scoring pipeline (without conformal p-values, which require a fitted
-        calibrator).
+        Each call to the returned function uses a thread-local preprocessor
+        so that concurrent threads don't race on LightCurvePreprocessor's
+        mutable scaler_params state.
         """
+        import threading
+        _local = threading.local()
+
+        # Capture the parts of self that are read-only during scoring
+        _scorer = self._scorer
+        _models = self._scorer._models
+        _impute_medians = self._impute_medians
+        _config = self.config
+
         def _pipeline_fn(df: pd.DataFrame) -> List[CandidateEvent]:
-            # use_cache=False: injection trials run concurrently in a ThreadPoolExecutor.
-            # All trials share star_id='__injection__', which would cause different
-            # injected light curves to collide on the same cache key, corrupting
-            # completeness estimates. Disabling the cache makes scoring stateless
-            # and thread-safe at the cost of re-extraction per trial.
-            return self.score_star(
-                star_id='__injection__',
-                df=df,
-                tls_cache=tls_cache,
-                use_cache=False,
+            # Give each thread its own preprocessor — LightCurvePreprocessor
+            # writes to self.scaler_params during preprocess(), making it
+            # unsafe to share across concurrent threads.
+            if not hasattr(_local, 'preprocessor'):
+                _local.preprocessor = LightCurvePreprocessor()
+
+            preprocessor = _local.preprocessor
+            df_proc = preprocessor.preprocess(df, normalize=True, sigma=_config.sigma_clip)
+            feats, _, _ = preprocessor.extract_features_with_metadata(
+                df_proc, star_id='__injection__',
+                window_size=_config.window_size,
+                stride=_config.stride,
             )
+
+            if len(feats) == 0:
+                return []
+
+            feats = _impute_nan(feats.astype(np.float32), _impute_medians)
+
+            raw_scores = MultiViewScorer.score_windows(_models, feats, _config.view_names)
+            composite = _scorer.composite(raw_scores)
+            threshold = _scorer.threshold
+
+            flagged_idx = np.where(composite >= threshold)[0]
+            if len(flagged_idx) == 0:
+                return []
+
+            n_win = len(composite)
+            meta = [
+                {
+                    'star_id': '__injection__',
+                    'window_idx': k,
+                    'start_time': float(k),
+                    'end_time': float(k + _config.window_size),
+                    'center_time': float(k + _config.window_size / 2),
+                }
+                for k in range(n_win)
+            ]
+
+            from backend.ml.events import generate_candidates
+            candidates = generate_candidates(
+                composite_scores=composite,
+                metadata=meta,
+                threshold=threshold,
+                per_model_scores=raw_scores,
+                gap_tolerance=_config.gap_tolerance,
+                max_event_windows=_config.max_event_windows,
+                event_score_method=_config.event_score_method,
+            )
+            return candidates
+
         return _pipeline_fn
 
     # ------------------------------------------------------------------

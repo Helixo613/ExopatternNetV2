@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import warnings
@@ -267,9 +268,14 @@ def run_star_cv(
     """
     Run star-level GroupKFold CV using the RankingPipeline.
 
+    All folds are run in parallel (ThreadPoolExecutor) since each fold creates
+    its own independent RankingPipeline instance.  The feature store and TLS
+    cache are read-only once warm, so thread-sharing is safe.
+
     Returns dict with per-fold metrics and aggregated results.
     """
     from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     dfs = dataset['dfs']
     gt_by_star = dataset['gt_events_by_star']
@@ -280,22 +286,18 @@ def run_star_cv(
     groups = np.array(star_ids)
 
     kf = GroupKFold(n_splits=n_splits)
-    per_fold: List[Dict] = []
-    conformal_diagnostics: List[Dict] = []
 
-    for fold_idx, (train_val_idx, test_idx) in enumerate(
-        kf.split(X_dummy, groups=groups)
-    ):
-        logger.info(f"\n=== Fold {fold_idx + 1}/{n_splits} ===")
+    # Generate all fold splits + rng states upfront (deterministic, same as sequential)
+    fold_splits = list(enumerate(kf.split(X_dummy, groups=groups)))
+    rng_states  = [int(rng.integers(0, 10_000)) for _ in fold_splits]
 
-        test_ids  = [star_ids[i] for i in test_idx]
+    def _run_fold(fold_idx, train_val_idx, test_idx, rng_state):
+        test_ids      = [star_ids[i] for i in test_idx]
         train_val_ids = [star_ids[i] for i in train_val_idx]
 
-        # 3-way split: proper-train / calibration
         n_train_val = len(train_val_ids)
         gss = GroupShuffleSplit(
-            n_splits=1, test_size=calib_fraction,
-            random_state=int(rng.integers(0, 10_000))
+            n_splits=1, test_size=calib_fraction, random_state=rng_state
         )
         X_tv = np.zeros(n_train_val)
         G_tv = np.array(train_val_ids)
@@ -305,7 +307,8 @@ def run_star_cv(
         calib_ids        = [train_val_ids[i] for i in calib_idx_local]
 
         logger.info(
-            f"  proper-train: {len(proper_train_ids)}  "
+            f"  [Fold {fold_idx+1}/{n_splits}] "
+            f"proper-train: {len(proper_train_ids)}  "
             f"calib: {len(calib_ids)}  test: {len(test_ids)}"
         )
 
@@ -314,34 +317,27 @@ def run_star_cv(
         test_dfs  = {k: dfs[k] for k in test_ids  if k in dfs}
 
         if not train_dfs:
-            logger.warning(f"  Fold {fold_idx}: no training data, skipping")
-            continue
+            logger.warning(f"  [Fold {fold_idx+1}] no training data, skipping")
+            return None, None
 
-        # Fit pipeline
         pipeline = RankingPipeline(config)
         pipeline.fit(train_dfs, tls_cache=tls_cache, gt_by_star=gt_by_star)
 
-        # Generate candidates on training stars (for consistency normalizer)
         train_cands = pipeline.score_stars(train_dfs, tls_cache)
         if train_cands:
             pipeline.fit_consistency_normalizer(train_cands)
 
-        # Calibration: collect FP candidates → conformal null.
-        # Must use the same threshold as test scoring to preserve exchangeability
-        # between calibration and test candidates (required for FAR guarantee).
         calib_cands = pipeline.score_stars(calib_dfs, tls_cache)
         fp_scores = _collect_fp_scores(calib_cands, gt_by_star)
-        logger.info(f"  Calibration FP candidates: {len(fp_scores)}")
+        logger.info(f"  [Fold {fold_idx+1}] Calibration FP candidates: {len(fp_scores)}")
 
         if len(fp_scores) > 0:
             pipeline.fit_conformal(np.array(fp_scores))
             conf_diag = calibration_diagnostics(np.array(fp_scores), ALPHA_LEVELS)
         else:
-            logger.warning("  No FP candidates for conformal — skipping calibration")
+            logger.warning(f"  [Fold {fold_idx+1}] No FP candidates — skipping conformal")
             conf_diag = {'n_null': 0, 'warning': 'empty null set'}
-        conformal_diagnostics.append(conf_diag)
 
-        # Test: score + evaluate
         test_cands = pipeline.score_stars(test_dfs, tls_cache)
         all_gt = []
         for sid in test_ids:
@@ -353,15 +349,54 @@ def run_star_cv(
         fold_metrics['n_calib'] = len(calib_ids)
         fold_metrics['n_test'] = len(test_ids)
         fold_metrics['n_fp_null'] = len(fp_scores)
-        per_fold.append(fold_metrics)
-
-        logger.info(
-            f"  Recall@K={fold_metrics['recall_at_k']:.3f}  "
-            f"AU-PR={fold_metrics['au_pr']:.3f}  "
-            f"EventF1={fold_metrics['event_f1']:.3f}"
+        fold_metrics['per_star'] = _per_star_metrics(
+            test_cands, test_ids, gt_by_star, dataset['metadata']
+        )
+        fold_metrics['period_bins'] = _period_bin_metrics(fold_metrics['per_star'])
+        fold_metrics['system_recall'] = _system_level_recall(
+            test_cands, test_ids, gt_by_star
         )
 
+        logger.info(
+            f"  [Fold {fold_idx+1}] "
+            f"Recall@K={fold_metrics['recall_at_k']:.3f}  "
+            f"AU-PR={fold_metrics['au_pr']:.3f}  "
+            f"EventF1={fold_metrics['event_f1']:.3f}  "
+            f"SystemRecall={fold_metrics['system_recall']:.3f}"
+        )
+        _log_period_bins(fold_metrics['period_bins'], fold_idx)
+        return fold_metrics, conf_diag
+
+    logger.info(f"Running {n_splits} CV folds in parallel...")
+    per_fold: List[Dict] = []
+    conformal_diagnostics: List[Dict] = []
+
+    with ThreadPoolExecutor(max_workers=n_splits) as executor:
+        futures = {
+            executor.submit(_run_fold, fold_idx, tv_idx, t_idx, rng_states[fold_idx]): fold_idx
+            for fold_idx, (tv_idx, t_idx) in fold_splits
+        }
+        fold_results = {}
+        for future in as_completed(futures):
+            fold_idx = futures[future]
+            try:
+                metrics, diag = future.result()
+                if metrics is not None:
+                    fold_results[fold_idx] = (metrics, diag)
+            except Exception as e:
+                logger.error(f"  Fold {fold_idx+1} failed: {e}")
+
+    # Restore fold order
+    for fold_idx in sorted(fold_results):
+        metrics, diag = fold_results[fold_idx]
+        per_fold.append(metrics)
+        conformal_diagnostics.append(diag)
+
     agg = aggregate_event_metrics(per_fold)
+    agg['system_recall_mean'] = float(np.mean([f['system_recall'] for f in per_fold]))
+    agg['system_recall_std']  = float(np.std( [f['system_recall'] for f in per_fold]))
+    agg['period_bins'] = _aggregate_period_bins(per_fold)
+
     return {
         'per_fold': per_fold,
         'aggregated': agg,
@@ -393,6 +428,189 @@ def _collect_fp_scores(
                 cand.ranking_score if cand.ranking_score is not None else cand.composite_score
             )
     return np.array(fp_scores)
+
+
+# ---------------------------------------------------------------------------
+# Per-star / period-bin diagnostics
+# ---------------------------------------------------------------------------
+
+# Period bins (days) — chosen to match astrophysical regimes:
+#   ultra-short (USP):   P < 3d  — hundreds of transits, anomaly detection ill-suited
+#   short:        3–10d          — tens of transits, marginal regime
+#   moderate:    10–50d          — 30–146 transits, transitional
+#   long:         > 50d          — <30 transits, anomaly detection most natural
+PERIOD_BINS = [
+    ('P<3d',   0.0,   3.0),
+    ('3-10d',  3.0,  10.0),
+    ('10-50d', 10.0, 50.0),
+    ('P>50d',  50.0, float('inf')),
+]
+
+
+def _per_star_metrics(
+    test_cands: List,
+    test_ids: List[str],
+    gt_by_star: Dict[str, List],
+    metadata: 'pd.DataFrame',
+) -> List[Dict]:
+    """
+    Compute per-star event metrics and attach orbital period from metadata.
+
+    Returns a list of dicts, one per test star.
+    """
+    from collections import defaultdict
+    from backend.ml.event_evaluation import match_events
+
+    # Build period lookup from metadata
+    period_lookup: Dict[str, float] = {}
+    if metadata is not None:
+        for _, row in metadata.iterrows():
+            sid = str(row['target_id'])
+            p = row.get('period', float('nan'))
+            period_lookup[sid] = float(p) if not pd.isna(p) else float('nan')
+
+    # Group candidates by star
+    cands_by_star: Dict[str, List] = defaultdict(list)
+    for cand in test_cands:
+        cands_by_star[cand.star_id].append(cand)
+
+    per_star = []
+    for sid in test_ids:
+        gt = gt_by_star.get(sid, [])
+        cands = cands_by_star.get(sid, [])
+        n_gt = len(gt)
+        period = period_lookup.get(sid, float('nan'))
+
+        if n_gt == 0:
+            per_star.append({
+                'star_id': sid,
+                'period': period,
+                'n_gt': 0,
+                'n_cands': len(cands),
+                'n_detected': 0,
+                'recall': float('nan'),
+                'precision': float('nan'),
+                'system_detected': False,
+            })
+            continue
+
+        tp_cands, fp_cands, detected_gt, _ = match_events(cands, gt)
+        n_detected = len(detected_gt)
+        recall    = n_detected / n_gt
+        precision = len(tp_cands) / max(len(cands), 1)
+
+        per_star.append({
+            'star_id': sid,
+            'period': period,
+            'n_gt': n_gt,
+            'n_cands': len(cands),
+            'n_detected': n_detected,
+            'recall': round(recall, 4),
+            'precision': round(precision, 4),
+            'system_detected': n_detected > 0,
+        })
+
+    return per_star
+
+
+def _period_bin_metrics(per_star: List[Dict]) -> Dict[str, Dict]:
+    """
+    Group per-star results into period bins and compute aggregate metrics.
+    """
+    bins: Dict[str, Dict] = {}
+    for bin_name, lo, hi in PERIOD_BINS:
+        stars = [s for s in per_star
+                 if not np.isnan(s['period']) and lo <= s['period'] < hi
+                 and not np.isnan(s['recall'])]
+        if not stars:
+            bins[bin_name] = {
+                'n_stars': 0,
+                'recall_mean': float('nan'),
+                'recall_std': float('nan'),
+                'system_recall': float('nan'),
+                'total_gt': 0,
+                'total_detected': 0,
+            }
+            continue
+        recalls = [s['recall'] for s in stars]
+        bins[bin_name] = {
+            'n_stars':       len(stars),
+            'recall_mean':   round(float(np.mean(recalls)), 4),
+            'recall_std':    round(float(np.std(recalls)), 4),
+            'system_recall': round(float(np.mean([s['system_detected'] for s in stars])), 4),
+            'total_gt':      int(sum(s['n_gt'] for s in stars)),
+            'total_detected': int(sum(s['n_detected'] for s in stars)),
+        }
+    return bins
+
+
+def _system_level_recall(
+    test_cands: List,
+    test_ids: List[str],
+    gt_by_star: Dict[str, List],
+) -> float:
+    """
+    Fraction of planet-host test stars where at least one transit was detected.
+    Stars with no GT events are excluded (they are quiet stars, not hosts).
+    """
+    from collections import defaultdict
+    from backend.ml.event_evaluation import match_events
+
+    cands_by_star: Dict[str, List] = defaultdict(list)
+    for cand in test_cands:
+        cands_by_star[cand.star_id].append(cand)
+
+    n_hosts = 0
+    n_detected = 0
+    for sid in test_ids:
+        gt = gt_by_star.get(sid, [])
+        if not gt:
+            continue   # not a planet host in our catalog
+        n_hosts += 1
+        cands = cands_by_star.get(sid, [])
+        if cands:
+            _, _, detected_gt, _ = match_events(cands, gt)
+            if detected_gt:
+                n_detected += 1
+
+    return n_detected / n_hosts if n_hosts > 0 else float('nan')
+
+
+def _log_period_bins(bins: Dict[str, Dict], fold_idx: int) -> None:
+    logger.info(f"  Period-bin breakdown (fold {fold_idx}):")
+    for bin_name, stats in bins.items():
+        if stats['n_stars'] == 0:
+            logger.info(f"    {bin_name:8s}: no stars")
+            continue
+        logger.info(
+            f"    {bin_name:8s}: {stats['n_stars']:3d} stars  "
+            f"recall={stats['recall_mean']:.3f}±{stats['recall_std']:.3f}  "
+            f"system={stats['system_recall']:.3f}  "
+            f"gt={stats['total_gt']}→detected={stats['total_detected']}"
+        )
+
+
+def _aggregate_period_bins(per_fold: List[Dict]) -> Dict[str, Dict]:
+    """Average period-bin metrics across folds."""
+    agg: Dict[str, Dict] = {}
+    for bin_name, _, _ in PERIOD_BINS:
+        fold_stats = [f['period_bins'].get(bin_name, {}) for f in per_fold]
+        fold_recalls = [s['recall_mean'] for s in fold_stats
+                        if s and not np.isnan(s.get('recall_mean', float('nan')))]
+        fold_sysrec  = [s['system_recall'] for s in fold_stats
+                        if s and not np.isnan(s.get('system_recall', float('nan')))]
+        total_gt  = sum(s.get('total_gt', 0) for s in fold_stats if s)
+        total_det = sum(s.get('total_detected', 0) for s in fold_stats if s)
+        n_stars   = int(np.mean([s.get('n_stars', 0) for s in fold_stats if s]))
+        agg[bin_name] = {
+            'n_stars_per_fold': n_stars,
+            'recall_mean':   round(float(np.mean(fold_recalls)), 4) if fold_recalls else float('nan'),
+            'recall_std':    round(float(np.std(fold_recalls)),  4) if fold_recalls else float('nan'),
+            'system_recall': round(float(np.mean(fold_sysrec)),  4) if fold_sysrec  else float('nan'),
+            'total_gt_across_folds':       total_gt,
+            'total_detected_across_folds': total_det,
+        }
+    return agg
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +656,25 @@ def _print_cv_table(results: Dict) -> None:
         mean = agg.get(f'{key}_mean', float('nan'))
         std  = agg.get(f'{key}_std',  float('nan'))
         logger.info(f"  {key:25s}: {mean:.4f} ± {std:.4f}")
+
+    # System-level recall
+    sr_mean = agg.get('system_recall_mean', float('nan'))
+    sr_std  = agg.get('system_recall_std',  float('nan'))
+    logger.info(f"  {'system_recall':25s}: {sr_mean:.4f} ± {sr_std:.4f}")
+
+    # Period-bin breakdown
+    bins = agg.get('period_bins', {})
+    if bins:
+        logger.info("\n--- Period-bin recall (mean across folds) ---")
+        logger.info(f"  {'Bin':10s}  {'Stars/fold':>10}  {'Recall':>8}  {'SysRecall':>10}  {'GT':>8}  {'Detected':>8}")
+        for bin_name, stats in bins.items():
+            if np.isnan(stats.get('recall_mean', float('nan'))):
+                continue
+            logger.info(
+                f"  {bin_name:10s}  {stats['n_stars_per_fold']:>10}  "
+                f"{stats['recall_mean']:>8.4f}  {stats['system_recall']:>10.4f}  "
+                f"{stats['total_gt_across_folds']:>8}  {stats['total_detected_across_folds']:>8}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -487,65 +724,94 @@ def experiment_3_ablation(dataset: Dict, dev_mode: bool = False) -> Dict:
     Ablation over:
     (a) TLS alpha weight [0.0, 0.3, 0.5, 0.7, 1.0]
     (b) Event score aggregation method [max, top3_mean, length_penalized]
+
+    All 8 configs are run in parallel (ThreadPoolExecutor, max 4 workers) since
+    they are fully independent.  The TLS cache and feature store are read-only
+    during CV, so thread-sharing is safe.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     logger.info("\n" + "="*60)
     logger.info("EXPERIMENT 3: Ablation study")
     logger.info("="*60)
 
     n_splits = 2 if dev_mode else N_CV_FOLDS
     tls_cache = precompute_tls_cache(dataset['dfs'])
-    ablation_results: Dict[str, List[Dict]] = {}
 
-    # (a) TLS alpha sweep
-    logger.info("\n--- (a) TLS alpha sweep ---")
-    alpha_results = []
-    for alpha in TLS_ALPHA_ABLATION:
-        logger.info(f"  alpha={alpha:.1f}")
-        cfg = PipelineConfig(
+    # Build all configs up front
+    alpha_specs = [
+        ('alpha', alpha, PipelineConfig(
             window_size=WINDOW_SIZE, stride=STRIDE, use_tls=True, alpha=alpha,
             flag_quantile=FLAG_QUANTILE, contamination=CONTAMINATION,
             feature_store_dir=str(FEATURE_STORE_DIR),
             max_train_windows=MAX_TRAIN_WINDOWS,
-        )
-        res = run_star_cv(dataset, cfg, n_splits=n_splits, tls_cache=tls_cache)
-        agg = res['aggregated']
-        row = {
-            'alpha': alpha,
-            'recall_at_k': agg.get('recall_at_k_mean', float('nan')),
-            'au_pr':        agg.get('au_pr_mean', float('nan')),
-        }
-        alpha_results.append(row)
-        logger.info(
-            f"    Recall@K={row['recall_at_k']:.4f}  AU-PR={row['au_pr']:.4f}"
-        )
-    ablation_results['alpha_sweep'] = alpha_results
-
-    # (b) Event score method
-    logger.info("\n--- (b) Event score method ---")
-    method_results = []
-    for method in EVENT_SCORE_ABLATION:
-        logger.info(f"  method={method}")
-        cfg = PipelineConfig(
+        ))
+        for alpha in TLS_ALPHA_ABLATION
+    ]
+    method_specs = [
+        ('method', method, PipelineConfig(
             window_size=WINDOW_SIZE, stride=STRIDE, use_tls=True, alpha=TLS_ALPHA,
             event_score_method=method, flag_quantile=FLAG_QUANTILE,
             contamination=CONTAMINATION,
             feature_store_dir=str(FEATURE_STORE_DIR),
             max_train_windows=MAX_TRAIN_WINDOWS,
-        )
+        ))
+        for method in EVENT_SCORE_ABLATION
+    ]
+    all_specs = alpha_specs + method_specs
+    logger.info(f"Running {len(all_specs)} ablation configs in parallel (max 4 workers)...")
+
+    def _run_one(spec):
+        kind, value, cfg = spec
+        logger.info(f"  [{kind}={value}] starting CV ({n_splits} folds)...")
         res = run_star_cv(dataset, cfg, n_splits=n_splits, tls_cache=tls_cache)
         agg = res['aggregated']
-        row = {
-            'method': method,
-            'recall_at_k': agg.get('recall_at_k_mean', float('nan')),
-            'au_pr':        agg.get('au_pr_mean', float('nan')),
-        }
-        method_results.append(row)
         logger.info(
-            f"    Recall@K={row['recall_at_k']:.4f}  AU-PR={row['au_pr']:.4f}"
+            f"  [{kind}={value}] done — "
+            f"Recall@K={agg.get('recall_at_k_mean', float('nan')):.4f}  "
+            f"AU-PR={agg.get('au_pr_mean', float('nan')):.4f}"
         )
-    ablation_results['event_score_method'] = method_results
+        return kind, value, agg
 
-    return ablation_results
+    alpha_rows: List[Dict] = []
+    method_rows: List[Dict] = []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_run_one, spec): spec for spec in all_specs}
+        for future in as_completed(futures):
+            try:
+                kind, value, agg = future.result()
+                if kind == 'alpha':
+                    alpha_rows.append({
+                        'alpha': value,
+                        'recall_at_k': agg.get('recall_at_k_mean', float('nan')),
+                        'au_pr':        agg.get('au_pr_mean', float('nan')),
+                    })
+                else:
+                    method_rows.append({
+                        'method': value,
+                        'recall_at_k': agg.get('recall_at_k_mean', float('nan')),
+                        'au_pr':        agg.get('au_pr_mean', float('nan')),
+                    })
+            except Exception as e:
+                spec = futures[future]
+                logger.error(f"  Ablation config {spec[0]}={spec[1]} failed: {e}")
+
+    # Restore original ordering
+    alpha_rows.sort(key=lambda r: TLS_ALPHA_ABLATION.index(r['alpha']))
+    method_rows.sort(key=lambda r: EVENT_SCORE_ABLATION.index(r['method']))
+
+    logger.info("\n--- Alpha sweep results ---")
+    for row in alpha_rows:
+        logger.info(f"  alpha={row['alpha']:.1f}  Recall@K={row['recall_at_k']:.4f}  AU-PR={row['au_pr']:.4f}")
+    logger.info("\n--- Event score method results ---")
+    for row in method_rows:
+        logger.info(f"  method={row['method']}  Recall@K={row['recall_at_k']:.4f}  AU-PR={row['au_pr']:.4f}")
+
+    return {
+        'alpha_sweep': alpha_rows,
+        'event_score_method': method_rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +945,6 @@ def experiment_5_injection_recovery(
     )
     pipeline = RankingPipeline(cfg)
     pipeline.fit(dfs)
-    pipeline_fn = pipeline.as_inference_fn()
 
     logger.info(
         f"Running injection-recovery: "
@@ -687,20 +952,24 @@ def experiment_5_injection_recovery(
         f"{n_trials} trials/cell"
     )
 
+    checkpoint = str(Path(RESULTS_DIR) / 'exp5_injection_checkpoint.json')
+
     def progress(done, total):
         if done % 50 == 0 or done == total:
             logger.info(f"  Progress: {done}/{total} ({100*done//total}%)")
 
     result = run_injection_recovery(
         light_curves=dfs,
-        pipeline_fn=pipeline_fn,
+        pipeline=pipeline,
         radius_grid=INJECTION_RADIUS_GRID,
         period_grid=INJECTION_PERIOD_GRID,
         n_trials=n_trials,
         rng_seed=RANDOM_SEED,
         recovery_window_factor=INJECTION_RECOVERY_WINDOW_FACTOR,
         progress_callback=progress,
-        n_workers=8,
+        n_workers=os.cpu_count(),
+        checkpoint_path=checkpoint,
+        checkpoint_interval=50,
     )
 
     summary = summarize_injection_recovery(result)

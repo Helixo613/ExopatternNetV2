@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
+
+# Ensure repo root is importable regardless of how this script is invoked
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import experiments.run_paper_experiments as rpe
 from backend.ml.pipeline import PipelineConfig
@@ -25,7 +29,9 @@ def main() -> None:
 
     t0 = time.time()
     dataset = rpe.load_dataset(rpe.METADATA_CSV, rpe.LIGHTCURVE_DIR)
-    result = rpe.run_star_cv(dataset, cfg, n_splits=2)
+    # Reuse the precomputed TLS disk cache — avoids recomputing TLS for all 178 stars
+    tls_cache = rpe.precompute_tls_cache(dataset['dfs'])
+    result = rpe.run_star_cv(dataset, cfg, n_splits=2, tls_cache=tls_cache)
 
     out = {
         "experiment": "exp1_root_cause_check",
