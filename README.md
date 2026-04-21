@@ -10,8 +10,7 @@ ML system for detecting exoplanet transits and stellar anomalies in astronomical
 - Trains and evaluates 8 anomaly detection models with 5-fold cross-validation
 - Generates publication-quality figures and LaTeX tables
 - Provides a Streamlit frontend for interactive analysis
-
-
+- 
 ## Project Structure
 
 ```
