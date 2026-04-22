@@ -1,13 +1,15 @@
-# Stellar Light Curve Anomaly Detector
+# ExopatternNet V3 — Stellar Light Curve Anomaly Detector
 
-ML system for detecting exoplanet transits and stellar anomalies in astronomical time-series data. Compares 8 anomaly detection models (classical + deep learning) on real Kepler/TESS light curves with ground truth labels from known exoplanet ephemerides. Designed for conference paper publication.
+ML system for detecting exoplanet transits and stellar anomalies in astronomical time-series data. Benchmarks 9 models (classical + period-search baselines + deep learning) on real Kepler/TESS light curves with NASA ephemeris ground truth. Built for conference paper publication (v3.1 research pipeline).
 
 ## What It Does
 
 - Downloads real stellar light curves from MAST (Kepler/TESS) via lightkurve
 - Creates per-point ground truth labels from NASA Exoplanet Archive ephemerides
 - Extracts 38 features per window across 5 feature groups (statistical, frequency, wavelet, autocorrelation, shape)
-- Trains and evaluates 8 anomaly detection models with 5-fold cross-validation
+- Trains and evaluates 9 models with 5-fold cross-validation including domain-specific period-search baselines (BLS, TLS)
+- Period-aware propagation: BLS/TLS detections propagate across orbital periods for fair per-point evaluation
+- V3 anomaly ranking pipeline with injection detection and cross-fold ablation
 - Generates publication-quality figures and LaTeX tables
 - Provides a Streamlit frontend for interactive analysis
 
@@ -88,7 +90,8 @@ python experiments/run_experiments.py --experiment 0  # All 7 experiments
 | One-Class SVM | Classical | Kernel-based novelty detection |
 | DBSCAN | Classical | Density clustering (outliers = unclustered) |
 | Ensemble (IF+LOF) | Classical | AND-logic ensemble requiring both models to agree |
-| BLS Detector | Domain | Box Least Squares transit search |
+| BLS Detector | Domain | Box Least Squares transit search with period-aware propagation |
+| TLS Detector | Domain | Transit Least Squares — fast direct per-star evaluation |
 | Conv1D Autoencoder | Deep Learning | 1D-CNN reconstruction error |
 | LSTM Autoencoder | Deep Learning | Sequence-based reconstruction error |
 
@@ -105,12 +108,12 @@ python experiments/run_experiments.py --experiment 0  # All 7 experiments
 ## Experiments
 
 1. **Model Comparison** — All models x 5-fold CV with precision/recall/F1/ROC-AUC
-2. **Feature Ablation** — Cumulative feature groups on best model
+2. **Feature Ablation** — Cumulative feature groups on best model (parallelized CV folds)
 3. **Per-Type Detection** — Metrics by anomaly type
 4. **Hyperparameter Sensitivity** — Contamination and window size sweeps
-5. **Detection Examples** — Qualitative light curve figures
-6. **Feature Importance** — From Isolation Forest trees
-7. **Statistical Significance** — Paired t-tests between top models
+5. **Detection Examples** — Qualitative light curve figures with injection feature caching
+6. **BLS Baseline** — Period-aware BLS propagation; fair per-point transit detection comparison
+7. **TLS Baseline** — Transit Least Squares with fast direct per-star evaluation
 
 ## Kaggle Workflow
 
